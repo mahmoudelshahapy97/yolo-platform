@@ -1,0 +1,14 @@
+numpy==2.2.6
+scipy==1.16.2
+opencv-python-headless==4.12.0.88
+redis==6.4.0
+psycopg[binary]==3.2.12
+asyncpg==0.30.0
+boto3==1.40.64
+tritonclient[grpc]==2.61.0
+prometheus-client==0.23.1
+pydantic==2.12.3
+# GPU decode path (DECODE_BACKEND=nvdec): PyAV demux, NVDEC sessions, CUDA letterbox kernel.
+av==15.1.0
+PyNvVideoCodec==2.2.2
+cupy-cuda13x[ctk]==14.0.1
