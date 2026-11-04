@@ -1,0 +1,16 @@
+{
+  "name": "fire_detection",
+  "task": "detect",
+  "imgsz": 640,
+  "max_batch": 16,
+  "num_classes": 3,
+  "names": {
+    "0": "0",
+    "1": "1",
+    "2": "2"
+  },
+  "weights": "fire.pt",
+  "architecture": "DetectionModel",
+  "embedded_nms": true,
+  "end2end": true
+}

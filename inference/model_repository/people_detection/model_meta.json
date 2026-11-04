@@ -1,0 +1,14 @@
+{
+  "name": "people_detection",
+  "task": "detect",
+  "imgsz": 640,
+  "max_batch": 16,
+  "num_classes": 1,
+  "names": {
+    "0": "0"
+  },
+  "weights": "people.pt",
+  "architecture": "DetectionModel",
+  "embedded_nms": true,
+  "end2end": true
+}

@@ -1,0 +1,39 @@
+# The models served by Triton. One entry per Triton model.
+#
+# The .pt in inference/weights/ is the source of truth. The pipeline is:
+# export_onnx.py -> wrap_uint8.py -> build_plan.sh, which produces
+# model_repository/<name>/<version>/model.plan plus config.pbtxt.
+#
+# max_batch is the largest batch the TensorRT profile accepts. Triton's
+# max_batch_size is set to the same value, never larger.
+models:
+  - name: yolo26n_detection
+    weights: yolo26n.pt
+    task: detect
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+  - name: people_detection
+    weights: people.pt
+    task: detect
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+  - name: fire_detection
+    weights: fire.pt
+    task: detect
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 4
+  - name: ppe_detection
+    weights: ppe_yolov8m.pt
+    task: detect
+    imgsz: 640
+    max_batch: 8
+    opt_batch: 4
+  - name: yolo26n_cls
+    weights: yolo26n-cls.pt
+    task: classify
+    imgsz: 224
+    max_batch: 32
+    opt_batch: 16

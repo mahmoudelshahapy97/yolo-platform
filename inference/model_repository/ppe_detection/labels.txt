@@ -1,0 +1,14 @@
+Fall-Detected
+Gloves
+Goggles
+Hardhat
+Ladder
+Mask
+NO-Gloves
+NO-Goggles
+NO-Hardhat
+NO-Mask
+NO-Safety Vest
+Person
+Safety Cone
+Safety Vest
