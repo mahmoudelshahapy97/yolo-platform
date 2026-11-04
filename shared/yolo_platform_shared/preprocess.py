@@ -71,11 +71,18 @@ def classify_crop(image_bgr: np.ndarray, size: int, out: np.ndarray | None = Non
     h, w = image_bgr.shape[:2]
     if h == 0 or w == 0:
         raise ValueError("empty crop")
+    # torchvision Resize(size): short side -> size, long side truncated (not rounded).
+    if w <= h:
+        new_w, new_h = size, int(size * h / w)
+    else:
+        new_w, new_h = int(size * w / h), size
     scale = size / min(h, w)
-    new_w, new_h = max(size, int(round(w * scale))), max(size, int(round(h * scale)))
+    # PIL's antialiased bilinear (what torchvision uses on PIL images) is closest to
+    # INTER_AREA when shrinking.
     interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
     resized = cv2.resize(image_bgr, (new_w, new_h), interpolation=interp)
-    top, left = (new_h - size) // 2, (new_w - size) // 2
+    # torchvision CenterCrop rounds the offsets.
+    top, left = int(round((new_h - size) / 2.0)), int(round((new_w - size) / 2.0))
     if out is None:
         out = np.empty((size, size, 3), dtype=np.uint8)
     out[...] = resized[top:top + size, left:left + size, ::-1]

@@ -1,0 +1,277 @@
+# YOLO Inference Platform: single GPU server.
+#
+# Public entry point: nginx only (HTTP ${HTTP_PORT:-8088} -> HTTPS ${HTTPS_PORT:-8443}).
+# Grafana is published for operators; Prometheus and the MinIO console on
+# 127.0.0.1 only. Triton, Redis, Postgres and the API have no host ports.
+#
+#   cp .env.example .env   # set secrets
+#   docker compose up -d --build
+#
+# The test RTSP source (mediamtx looping clips) is in the "testsrc" profile:
+#   docker compose --profile testsrc up -d mediamtx
+
+x-worker-env: &worker-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-inference}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-inference}
+  REDIS_URL: redis://redis:6379/0
+  TRITON_URL: triton:8001
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-yolo}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+  S3_BUCKET: ${S3_BUCKET:-yolo-platform}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: 1
+          capabilities: [gpu, video, compute, utility]
+
+services:
+  triton:
+    image: ${TRITON_IMAGE:-nvcr.io/nvidia/tritonserver:25.10-py3}
+    command:
+      - tritonserver
+      - --model-repository=/models
+      # The API's model registry decides which version of each model is loaded.
+      - --model-control-mode=explicit
+      - --strict-readiness=true
+      - --allow-http=true
+      - --allow-grpc=true
+      - --allow-metrics=true
+      - --allow-gpu-metrics=true
+      - --metrics-interval-ms=2000
+      - --exit-timeout-secs=30
+      - --log-verbose=0
+    volumes:
+      - ./inference/model_repository:/models:ro
+    shm_size: "2gb"
+    ipc: shareable
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy: *gpu
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v2/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-inference}
+      POSTGRES_USER: ${POSTGRES_USER:-inference}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits: {memory: 1g}
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.6-alpine
+    # AOF for job and event streams; noeviction so queued work is never dropped silently.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--maxmemory", "1gb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits: {memory: 1200m}
+    restart: unless-stopped
+
+  minio:
+    # MinIO no longer publishes community images on Docker Hub; Chainguard's build, pinned by digest.
+    image: cgr.dev/chainguard/minio@sha256:2136d593beacf4461187035eca949fe49abd589d5079735025c711ca58fee0c8
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-yolo}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9011}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build: {context: ., dockerfile: api/Dockerfile}
+    image: yolo-platform-api:${TAG:-dev}
+    command: ["python", "-m", "app.db.migrate"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-inference}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-inference}
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    build: {context: ., dockerfile: api/Dockerfile}
+    image: yolo-platform-api:${TAG:-dev}
+    environment:
+      <<: *worker-env
+      TRITON_HTTP_URL: http://triton:8000
+      MODEL_REPOSITORY: /models
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY}
+      MAX_INFLIGHT: ${API_MAX_INFLIGHT:-64}
+    volumes:
+      # Read-write: version uploads land here (Triton mounts it read-only).
+      - ./inference/model_repository:/models
+    depends_on:
+      triton: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_healthy}
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 2g}
+    restart: unless-stopped
+
+  # One process per shard; each leases a fair share of the enabled cameras.
+  # Scale with: docker compose up -d --scale camera-shard=N
+  camera-shard:
+    build: {context: ., dockerfile: workers/Dockerfile}
+    image: yolo-platform-worker:${TAG:-dev}
+    command: ["python", "-m", "workers.camera_shard"]
+    environment:
+      <<: *worker-env
+      DECODE_BACKEND: ${DECODE_BACKEND:-nvdec}
+      SHARD_MAX_CAMERAS: ${SHARD_MAX_CAMERAS:-40}
+      TRITON_SHM: ${TRITON_SHM:-system}
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    ipc: "service:triton"
+    deploy:
+      replicas: ${CAMERA_SHARDS:-2}
+      <<: *gpu
+    depends_on:
+      api: {condition: service_healthy}
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  video-worker:
+    build: {context: ., dockerfile: workers/Dockerfile}
+    image: yolo-platform-worker:${TAG:-dev}
+    command: ["python", "-m", "workers.video_worker"]
+    environment:
+      <<: *worker-env
+    deploy:
+      replicas: ${VIDEO_WORKERS:-1}
+      resources:
+        limits: {cpus: "1.5", memory: 2g}
+    depends_on:
+      api: {condition: service_healthy}
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  event-processor:
+    build: {context: ., dockerfile: workers/Dockerfile}
+    image: yolo-platform-worker:${TAG:-dev}
+    command: ["python", "-m", "workers.event_processor"]
+    environment:
+      <<: *worker-env
+    depends_on:
+      api: {condition: service_healthy}
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 512m}
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.29.3-alpine
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs
+      - ./deploy/nginx/entrypoint.sh:/docker-entrypoint.d/05-certs.sh:ro
+    ports:
+      - "${HTTP_PORT:-8088}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9091}:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.2.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.6.0-ubuntu22.04
+    cap_add: [SYS_ADMIN]
+    deploy: *gpu
+    restart: unless-stopped
+
+  backup:
+    image: postgres:17.6-alpine
+    # Nightly pg_dump at 02:30, keeping BACKUP_KEEP_DAYS days of dumps in ./backups.
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-inference}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-inference}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - ./deploy/backup.sh:/backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Test RTSP server: loops the clips in ./videos (see tools/gen_substreams.sh).
+  mediamtx:
+    profiles: ["testsrc"]
+    image: bluenviron/mediamtx:1.15.3-ffmpeg
+    volumes:
+      - ./deploy/mediamtx.yml:/mediamtx.yml:ro
+      - ./videos:/videos:ro
+    ports:
+      - "${RTSP_PORT:-8558}:8554"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  prometheus-data:
+  grafana-data:
