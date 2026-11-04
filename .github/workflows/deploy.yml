@@ -1,0 +1,139 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'artifacts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    # Off until the repository variable DEPLOY_ENABLED is set to true, so a merge
+    # to main neither deploys nor fails on missing secrets before the host is ready.
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: Check deploy secrets
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_FINGERPRINT: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          missing=()
+          for v in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_HOST_FINGERPRINT DEPLOY_PATH; do
+            [ -n "${!v}" ] || missing+=("$v")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Deploy to the GPU host over SSH
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
+          envs: DEPLOY_PATH,SHA
+          command_timeout: 60m
+          script: |
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            MIN_FREE_GB=10
+            env_value() { grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true; }
+            free_gb() { df --output=avail -BG / | tail -1 | tr -dc 0-9; }
+
+            OLD=$(git rev-parse HEAD)
+            git fetch --prune origin
+            STAMP=$(date +%Y%m%d-%H%M%S)
+            G="git -c user.name=deploy -c user.email=deploy@localhost"
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              $G stash push -m "pre-deploy $STAMP"
+              echo "WARNING: uncommitted server changes are in git stash list (pre-deploy $STAMP)"
+            fi
+            git reset --hard "$SHA"
+            echo "Deploying $OLD -> $(git rev-parse HEAD)"
+
+            if ! docker compose config -q; then
+              echo "ERROR: docker compose config failed; nothing changed"
+              git reset --hard "$OLD"; exit 1
+            fi
+
+            changed=$(git diff --name-only "$OLD" HEAD)
+            # Engines are built on this host (they are GPU- and TensorRT-specific) and
+            # are not in git: a change to the model list needs a manual rebuild.
+            if printf "%s\n" "$changed" | grep -qE '^inference/(models\.yaml|export/)'; then
+              echo "::warning::inference/ changed: rebuild engines (inference/export) and deploy new versions via /v1/models"
+            fi
+
+            rebuild=""
+            img() { echo "yolo-platform-$1:dev"; }
+            for svc in api worker; do
+              case $svc in api) dirs='^(api/|shared/|database/migrations/)';; worker) dirs='^(workers/|shared/)';; esac
+              if ! docker image inspect "$(img $svc)" >/dev/null 2>&1 || printf "%s\n" "$changed" | grep -qE "$dirs"; then
+                rebuild="$rebuild $svc"
+              fi
+            done
+
+            HTTP_PORT=$(env_value HTTP_PORT)
+            healthy() {
+              for _ in $(seq 1 60); do
+                curl -fsS -o /dev/null "http://localhost:${HTTP_PORT:-8088}/health/live" \
+                  && docker compose exec -T api curl -fsS -o /dev/null http://localhost:8000/health/ready && return 0
+                sleep 5
+              done
+              return 1
+            }
+            rollback() {
+              echo "ERROR: $1, rolling back to $OLD"
+              docker compose logs --tail 100 api camera-shard || true
+              git reset --hard "$OLD"
+              for svc in $rebuild; do
+                docker image inspect "$(img $svc | sed 's/:dev$/:previous/')" >/dev/null 2>&1 \
+                  && docker tag "$(img $svc | sed 's/:dev$/:previous/')" "$(img $svc)"
+              done
+              docker compose up -d --no-build --remove-orphans || true
+              healthy || echo "ERROR: rollback is not healthy either"
+            }
+
+            docker container prune -f; docker image prune -f; docker builder prune -f --filter until=168h
+            if [ -n "$rebuild" ]; then
+              echo "==> Rebuilding:$rebuild"
+              [ "$(free_gb)" -lt "$MIN_FREE_GB" ] && docker builder prune -af
+              if [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; then
+                echo "ERROR: only $(free_gb)G free; nothing changed"; git reset --hard "$OLD"; exit 1
+              fi
+              for svc in $rebuild; do
+                docker image inspect "$(img $svc)" >/dev/null 2>&1 && docker tag "$(img $svc)" "$(img $svc | sed 's/:dev$/:previous/')"
+              done
+              services=""
+              for svc in $rebuild; do case $svc in api) services="$services api";; worker) services="$services camera-shard";; esac; done
+              if ! docker compose build $services; then
+                echo "ERROR: build failed; running containers untouched"; git reset --hard "$OLD"; exit 1
+              fi
+            fi
+
+            echo "==> Start stack"
+            if ! docker compose up -d --no-build --remove-orphans; then rollback "docker compose up failed"; exit 1; fi
+            if ! healthy; then rollback "not healthy"; exit 1; fi
+            echo "Deployed $(git rev-parse --short HEAD)"

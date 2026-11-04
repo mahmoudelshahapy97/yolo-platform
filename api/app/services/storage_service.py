@@ -2,6 +2,7 @@
 
 import asyncio
 from typing import BinaryIO, Optional
+from urllib.parse import urlsplit
 
 import boto3
 from botocore.config import Config
@@ -10,8 +11,9 @@ from botocore.exceptions import ClientError
 
 class Storage:
     def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket: str, region: str,
-                 public_endpoint: Optional[str] = None) -> None:
+                 public_endpoint: Optional[str] = None, public_prefix: str = "") -> None:
         self.bucket = bucket
+        self.public_prefix = public_prefix.rstrip("/")
         kwargs = dict(aws_access_key_id=access_key or None, aws_secret_access_key=secret_key or None,
                       region_name=region, config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
                                                         retries={"max_attempts": 3}))
@@ -38,5 +40,10 @@ class Storage:
         await asyncio.to_thread(self._s3.upload_fileobj, fileobj, self.bucket, key, ExtraArgs={"ContentType": content_type})
 
     async def presign(self, key: str, expires: int = 3600) -> str:
-        return await asyncio.to_thread(self._signer.generate_presigned_url, "get_object",
-                                       Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
+        url = await asyncio.to_thread(self._signer.generate_presigned_url, "get_object",
+                                      Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires)
+        if self.public_prefix:
+            # Signed for the internal endpoint; the proxy forwards with that Host header.
+            parts = urlsplit(url)
+            return f"{self.public_prefix}{parts.path}?{parts.query}"
+        return url

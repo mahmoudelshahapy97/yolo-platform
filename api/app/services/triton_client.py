@@ -1,13 +1,10 @@
 """Async gRPC client for Triton, shared by every request in an API process."""
 
-import json
 import logging
 from typing import Dict, Optional
 
 import numpy as np
 import tritonclient.grpc.aio as grpcclient
-from google.protobuf import json_format, text_format
-from tritonclient.grpc import model_config_pb2
 from tritonclient.utils import InferenceServerException
 
 logger = logging.getLogger(__name__)
@@ -56,16 +53,9 @@ class TritonClient:
         idx = await self.client.get_model_repository_index(as_json=True)
         return idx.get("models", [])
 
-    async def load(self, name: str, versions: list[int], repo_config_text: str) -> None:
-        """Load exactly ``versions`` of ``name`` (explicit model control).
-
-        Triton's load request replaces the whole model config, so the repository's
-        config.pbtxt is parsed and only its version policy is overridden.
-        """
-        cfg = text_format.Parse(repo_config_text, model_config_pb2.ModelConfig())
-        cfg.version_policy.Clear()
-        cfg.version_policy.specific.versions.extend(sorted(set(versions)))
-        await self.client.load_model(name, config=json.dumps(json_format.MessageToDict(cfg)))
+    async def load(self, name: str) -> None:
+        """Load ``name`` from the serving repository (explicit model control)."""
+        await self.client.load_model(name)
 
     async def unload(self, name: str) -> None:
         await self.client.unload_model(name)

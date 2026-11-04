@@ -1,17 +1,24 @@
 """Model registry: which model versions exist, which one is active, and rollouts.
 
-The source of truth for *what exists* is the Triton model repository on disk
-(<repo>/<name>/<version>/model.plan + model_meta.json). The source of truth for
-*which version serves* is Postgres (model_version.status = 'active'), mirrored to
-the Redis hash ``models:active`` so camera and video workers pick the same
-version without a database round trip.
+The source of truth for *what exists* is the model repository on disk
+(<repo>/<name>/<version>/model.plan + model_meta.json + golden.npz). The source of
+truth for *which version serves* is Postgres (model_version.status = 'active'),
+mirrored to the Redis hash ``models:active`` so camera and video workers use the
+same version without a database round trip.
+
+Every registry version is served as its own Triton model, ``<name>__v<version>``,
+in a generated serving repository (config derived from <repo>/<name>/config.pbtxt,
+plan symlinked from <repo>/<name>/<version>/). A model that is serving is never
+reloaded: with Triton 25.10, re-loading a detector (embedded NMS) while one of its
+versions is kept made the next request to the kept version segfault the server.
 
 Activating a version (first boot, rollout or rollback):
-  1. load the candidate next to the current version (explicit model control),
-  2. run the gate: the candidate's outputs on its golden.npz must match the
-     reference recorded from the .pt (shared/yolo_platform_shared/gate.py),
-  3. if it passes: mark it active and publish it; the old version stays loaded
-     for ``drain_s`` seconds so in-flight requests finish, then is unloaded,
+  1. load ``<name>__v<new>`` next to the serving model (explicit model control),
+  2. run the gate: its outputs on golden.npz must match the reference recorded
+     from the .pt (shared/yolo_platform_shared/gate.py), and the plan's sha256 must
+     match,
+  3. if it passes: mark it active and publish it; the old model stays loaded for
+     ``drain_s`` seconds so in-flight requests finish, then is unloaded,
   4. if it fails: mark it failed and unload it; the current version keeps serving.
 Every rollout for a model holds a Redis lock, so two API processes never race.
 """
@@ -20,6 +27,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +36,9 @@ from typing import Dict, Optional
 
 import asyncpg
 import numpy as np
+from google.protobuf import text_format
 from redis.asyncio import Redis
+from tritonclient.grpc import model_config_pb2
 
 from yolo_platform_shared.gate import evaluate_classify, evaluate_detect
 
@@ -39,6 +50,11 @@ ACTIVE_KEY = "models:active"
 CHANNEL = "models:changed"
 
 
+def serve_name(name: str, version: int) -> str:
+    """Triton model name serving registry version ``version`` of ``name``."""
+    return f"{name}__v{version}"
+
+
 @dataclass
 class ActiveModel:
     name: str
@@ -47,6 +63,10 @@ class ActiveModel:
     imgsz: int
     max_batch: int
     names: Dict[int, str]
+
+    @property
+    def serve_name(self) -> str:
+        return serve_name(self.name, self.version)
 
 
 class GateFailed(Exception):
@@ -64,11 +84,15 @@ def file_sha256(path: Path) -> str:
 
 
 class ModelRegistry:
-    def __init__(self, pool: asyncpg.Pool, redis: Redis, triton: TritonClient, repository: Path, drain_s: float = 10.0):
+    def __init__(self, pool: asyncpg.Pool, redis: Redis, triton: TritonClient, repository: Path, serving: Path,
+                 drain_s: float = 10.0, triton_models_path: str = "/models"):
         self.pool = pool
         self.redis = redis
         self.triton = triton
         self.repository = repository
+        self.serving = serving
+        # Where Triton sees the source repository (the serving symlinks point there).
+        self.triton_models_path = triton_models_path.rstrip("/")
         self.drain_s = drain_s
         self._cache: Dict[str, ActiveModel] = {}
         self._cache_at = 0.0
@@ -146,6 +170,60 @@ class ModelRegistry:
         }
         self._cache_at = time.monotonic()
 
+    # ---------- serving repository ----------
+
+    def materialize(self, name: str, version: int) -> str:
+        """Write serving/<name>__v<version>/ (config + symlinked plan); returns the Triton model name."""
+        sname = serve_name(name, version)
+        src_cfg = (self.repository / name / "config.pbtxt").read_text()
+        cfg = text_format.Parse(src_cfg, model_config_pb2.ModelConfig())
+        cfg.name = sname
+        cfg.ClearField("version_policy")  # one version (1) per serving model: Triton default
+        if cfg.output and cfg.output[0].label_filename:
+            cfg.output[0].label_filename = "labels.txt"
+        target = self.serving / sname
+        tmp = self.serving / f".{sname}.tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        (tmp / "1").mkdir(parents=True)
+        (tmp / "config.pbtxt").write_text(text_format.MessageToString(cfg))
+        os.symlink(f"{self.triton_models_path}/{name}/{version}/model.plan", tmp / "1" / "model.plan")
+        if (self.repository / name / "labels.txt").is_file():
+            os.symlink(f"{self.triton_models_path}/{name}/labels.txt", tmp / "labels.txt")
+        shutil.rmtree(target, ignore_errors=True)
+        tmp.rename(target)
+        return sname
+
+    async def _loaded(self) -> set:
+        """Triton model names currently READY."""
+        try:
+            index = await self.triton.repository_index()
+        except Exception:
+            return set()
+        return {m["name"] for m in index if m.get("state") == "READY"}
+
+    async def _ensure_loaded(self, name: str, version: int) -> str:
+        sname = serve_name(name, version)
+        if sname not in await self._loaded():
+            await asyncio.to_thread(self.materialize, name, version)
+            await self.triton.load(sname)
+        await self._wait_ready(sname)
+        return sname
+
+    async def _wait_ready(self, sname: str, timeout: float = 120.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await self.triton.model_ready(sname):
+                return
+            await asyncio.sleep(0.5)
+        raise TimeoutError(f"{sname} not ready after {timeout}s")
+
+    async def _unload(self, name: str, version: int) -> None:
+        sname = serve_name(name, version)
+        try:
+            await self.triton.unload(sname)
+        except Exception as exc:
+            logger.warning("unload %s: %s", sname, exc)
+
     # ---------- rollout ----------
 
     async def gate(self, name: str, version: int) -> dict:
@@ -162,18 +240,10 @@ class ModelRegistry:
         inputs = golden["inputs"]
         outs = []
         for start in range(0, len(inputs), meta["max_batch"]):
-            outs.append(await self.triton.infer(name, version, inputs[start:start + meta["max_batch"]]))
+            outs.append(await self.triton.infer(serve_name(name, version), 1, inputs[start:start + meta["max_batch"]]))
         outputs = np.concatenate(outs)
         evaluate = evaluate_classify if meta["task"] == "classify" else evaluate_detect
         return await asyncio.to_thread(evaluate, golden, outputs)
-
-    async def _wait_ready(self, name: str, version: int, timeout: float = 120.0) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if await self.triton.model_ready(name, str(version)):
-                return
-            await asyncio.sleep(0.5)
-        raise TimeoutError(f"{name} v{version} not ready after {timeout}s")
 
     async def activate(self, name: str, version: int, reason: str = "rollout") -> dict:
         lock = self.redis.lock(f"lock:model:{name}", timeout=600, blocking_timeout=600)
@@ -185,22 +255,17 @@ class ModelRegistry:
             if row is None:
                 raise LookupError(f"{name} v{version} is not registered")
             if current == version:
+                await self._ensure_loaded(name, version)
                 await self.publish()
                 return {"model": name, "version": version, "status": "active", "changed": False}
-            config_text = (self.repository / name / "config.pbtxt").read_text()
-            keep = [current] if current is not None else []
-            await self.triton.load(name, keep + [version], config_text)
-            await self._wait_ready(name, version)
+            await self._ensure_loaded(name, version)
             report = await self.gate(name, version)
             report["reason"] = reason
             if not report.get("passed"):
                 await self.pool.execute(
                     "UPDATE model_version SET status = 'failed', gate_report = $3 WHERE model_name = $1 AND version = $2",
                     name, version, json.dumps(report))
-                if keep:
-                    await self.triton.load(name, keep, config_text)
-                else:
-                    await self.triton.unload(name)
+                await self._unload(name, version)
                 raise GateFailed(report)
             async with self.pool.acquire() as conn, conn.transaction():
                 await conn.execute(
@@ -211,17 +276,19 @@ class ModelRegistry:
             self._cache_at = 0.0
             await self.publish()
             logger.info("%s: v%s active (was v%s, %s)", name, version, current, reason)
-        if keep:
-            asyncio.create_task(self._drain_and_unload(name, version, config_text))
-        return {"model": name, "version": version, "previous": current, "status": "active", "changed": True, "gate": report}
+        if current is not None:
+            asyncio.create_task(self._drain_and_unload(name, current))
+        return {"model": name, "version": version, "previous": current, "status": "active", "changed": True,
+                "gate": report}
 
-    async def _drain_and_unload(self, name: str, version: int, config_text: str) -> None:
+    async def _drain_and_unload(self, name: str, old_version: int) -> None:
+        """Unload the previous version once in-flight requests (and workers' version caches) moved on."""
         await asyncio.sleep(self.drain_s)
         async with self.redis.lock(f"lock:model:{name}", timeout=600, blocking_timeout=600):
             still = await self.pool.fetchval(
                 "SELECT version FROM model_version WHERE model_name = $1 AND status = 'active'", name)
-            if still == version:
-                await self.triton.load(name, [version], config_text)
+            if still != old_version:
+                await self._unload(name, old_version)
 
     async def rollback(self, name: str) -> dict:
         previous = await self.pool.fetchval(
@@ -235,8 +302,9 @@ class ModelRegistry:
         """Mirror the active versions to Redis for the workers."""
         rows = await self.pool.fetch(
             "SELECT model_name, version, task, imgsz, max_batch, names FROM model_version WHERE status = 'active'")
-        mapping = {r["model_name"]: json.dumps({"version": r["version"], "task": r["task"], "imgsz": r["imgsz"],
-                                                 "max_batch": r["max_batch"], "names": json.loads(r["names"])})
+        mapping = {r["model_name"]: json.dumps({"version": r["version"], "serve_name": serve_name(r["model_name"], r["version"]),
+                                                 "task": r["task"], "imgsz": r["imgsz"], "max_batch": r["max_batch"],
+                                                 "names": json.loads(r["names"])})
                    for r in rows}
         pipe = self.redis.pipeline()
         pipe.delete(ACTIVE_KEY)
@@ -248,15 +316,14 @@ class ModelRegistry:
     async def bootstrap(self) -> None:
         """On start: register new versions, load each active version, activate the newest for models with none."""
         async with self.redis.lock("lock:models:bootstrap", timeout=900, blocking_timeout=900):
+            self.serving.mkdir(parents=True, exist_ok=True)
             await self.sync()
             on_disk = self.repository_versions()
             active = {r["model_name"]: r["version"] for r in await self.pool.fetch(
                 "SELECT model_name, version FROM model_version WHERE status = 'active'")}
             for name, versions in on_disk.items():
-                config_text = (self.repository / name / "config.pbtxt").read_text()
                 if name in active and active[name] in versions:
-                    if not await self.triton.model_ready(name, str(active[name])):
-                        await self.triton.load(name, [active[name]], config_text)
+                    await self._ensure_loaded(name, active[name])
                     continue
                 candidates = [v for v in versions if await self._status(name, v) not in ("failed",)]
                 if not candidates:
@@ -267,6 +334,39 @@ class ModelRegistry:
                 except GateFailed as exc:
                     logger.error("%s v%s failed its gate on bootstrap: %s", name, max(candidates), exc.report)
             await self.publish()
+
+    async def watchdog(self, every_s: float = 10.0) -> None:
+        """Reload active versions Triton no longer serves (a Triton restart comes back with
+        nothing loaded in explicit model-control mode), and unload strays (left by a crash
+        mid-rollout). Skips any model whose rollout lock is held."""
+        while True:
+            await asyncio.sleep(every_s)
+            try:
+                if not await self.triton.live():
+                    continue
+                active = {r["model_name"]: r["version"] for r in await self.pool.fetch(
+                    "SELECT model_name, version FROM model_version WHERE status = 'active'")}
+                loaded = await self._loaded()
+                wanted = {serve_name(n, v) for n, v in active.items()}
+                names = set(active) | {s.split("__v")[0] for s in loaded if "__v" in s}
+                for name in names:
+                    lock = self.redis.lock(f"lock:model:{name}", timeout=600, blocking_timeout=0.5)
+                    if not await lock.acquire():
+                        continue  # a rollout (or another API process) is on it
+                    try:
+                        loaded = await self._loaded()
+                        if name in active and serve_name(name, active[name]) not in loaded:
+                            logger.warning("%s v%s is not loaded in Triton; reloading", name, active[name])
+                            await self._ensure_loaded(name, active[name])
+                        for stray in [s for s in loaded if s.startswith(f"{name}__v") and s not in wanted]:
+                            logger.warning("unloading stray %s", stray)
+                            await self.triton.unload(stray)
+                    finally:
+                        await lock.release()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("model watchdog")
 
     async def _status(self, name: str, version: int) -> Optional[str]:
         return await self.pool.fetchval(

@@ -17,3 +17,5 @@ inference/model_repository/*/*/model.plan.sha256
 inference/model_repository/*/.upload-*
 backups/*
 !backups/.gitkeep
+inference/serving/*
+!inference/serving/.gitkeep

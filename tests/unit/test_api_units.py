@@ -59,6 +59,35 @@ def test_rate_limiter_token_bucket():
     asyncio.run(run())
 
 
+def test_materialize_writes_a_per_version_serving_model(tmp_path):
+    import shutil
+
+    from google.protobuf import text_format
+    from tritonclient.grpc import model_config_pb2
+
+    from app.services.model_registry import ModelRegistry, serve_name
+
+    repo, serving = tmp_path / "models", tmp_path / "serving"
+    for name in ("yolo26n_detection", "yolo26n_cls"):
+        (repo / name / "3").mkdir(parents=True)
+        shutil.copy(ROOT / "inference/model_repository" / name / "config.pbtxt", repo / name / "config.pbtxt")
+        shutil.copy(ROOT / "inference/model_repository" / name / "labels.txt", repo / name / "labels.txt")
+        (repo / name / "3" / "model.plan").write_bytes(b"plan")
+    serving.mkdir()
+    reg = ModelRegistry(None, None, None, repo, serving, triton_models_path="/models")
+    for name in ("yolo26n_detection", "yolo26n_cls"):
+        sname = reg.materialize(name, 3)
+        assert sname == serve_name(name, 3) == f"{name}__v3"
+        cfg = text_format.Parse((serving / sname / "config.pbtxt").read_text(), model_config_pb2.ModelConfig())
+        assert cfg.name == sname and not cfg.HasField("version_policy")
+        assert cfg.input[0].data_type == model_config_pb2.TYPE_UINT8 and cfg.dynamic_batching.preferred_batch_size
+        link = serving / sname / "1" / "model.plan"
+        assert link.is_symlink() and str(link.readlink()) == f"/models/{name}/3/model.plan"
+    # Re-materialising replaces the directory atomically.
+    assert reg.materialize("yolo26n_cls", 3) == "yolo26n_cls__v3"
+    assert sorted(p.name for p in serving.iterdir()) == ["yolo26n_cls__v3", "yolo26n_detection__v3"]
+
+
 def test_triton_load_config_overrides_only_version_policy():
     from google.protobuf import json_format, text_format
     from tritonclient.grpc import model_config_pb2

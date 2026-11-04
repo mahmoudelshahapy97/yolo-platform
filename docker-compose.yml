@@ -33,7 +33,7 @@ services:
     image: ${TRITON_IMAGE:-nvcr.io/nvidia/tritonserver:25.10-py3}
     command:
       - tritonserver
-      - --model-repository=/models
+      - --model-repository=/serving
       # The API's model registry decides which version of each model is loaded.
       - --model-control-mode=explicit
       - --strict-readiness=true
@@ -45,7 +45,10 @@ services:
       - --exit-timeout-secs=30
       - --log-verbose=0
     volumes:
-      - ./inference/model_repository:/models:ro
+      # /models: source repository (versions, golden files); /serving: the per-version
+      # models the API generates from it (plans are symlinks into /models).
+      - ${MODEL_REPO_DIR:-./inference/model_repository}:/models:ro
+      - ${SERVING_DIR:-./inference/serving}:/serving:ro
     shm_size: "2gb"
     ipc: shareable
     ulimits:
@@ -126,15 +129,20 @@ services:
   api:
     build: {context: ., dockerfile: api/Dockerfile}
     image: yolo-platform-api:${TAG:-dev}
+    # Runs as the owner of the model repository, because version uploads write into it.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
     environment:
       <<: *worker-env
       TRITON_HTTP_URL: http://triton:8000
       MODEL_REPOSITORY: /models
       ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY}
       MAX_INFLIGHT: ${API_MAX_INFLIGHT:-64}
+      # Presigned links are returned as /storage/<bucket>/<key>?..., served by nginx.
+      S3_PUBLIC_PREFIX: ${S3_PUBLIC_PREFIX:-/storage}
     volumes:
       # Read-write: version uploads land here (Triton mounts it read-only).
-      - ./inference/model_repository:/models
+      - ${MODEL_REPO_DIR:-./inference/model_repository}:/models
+      - ${SERVING_DIR:-./inference/serving}:/serving
     depends_on:
       triton: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -194,17 +202,34 @@ services:
         limits: {cpus: "0.5", memory: 512m}
     restart: unless-stopped
 
+  certs:
+    image: alpine/openssl:3.5.4
+    entrypoint: ["/bin/sh", "/gen_cert.sh"]
+    environment:
+      TLS_HOSTNAMES: ${TLS_HOSTNAMES:-}
+    volumes:
+      - ./deploy/nginx/gen_cert.sh:/gen_cert.sh:ro
+      - ./deploy/nginx/certs:/certs
+    restart: "no"
+
   nginx:
     image: nginx:1.29.3-alpine
+    environment:
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
     volumes:
-      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./deploy/nginx/certs:/etc/nginx/certs
-      - ./deploy/nginx/entrypoint.sh:/docker-entrypoint.d/05-certs.sh:ro
+      - ./deploy/nginx/templates:/etc/nginx/templates:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
     ports:
       - "${HTTP_PORT:-8088}:80"
       - "${HTTPS_PORT:-8443}:443"
     depends_on:
       api: {condition: service_healthy}
+      certs: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   prometheus:

@@ -28,7 +28,8 @@ async def ready(request: Request, response: Response):
     active = await core.registry.all_active() if checks["postgres"] else {}
     models = {}
     for name, m in active.items():
-        models[name] = {"version": m.version, "ready": await core.triton.model_ready(name, str(m.version))}
+        models[name] = {"version": m.version, "triton_model": m.serve_name,
+                        "ready": await core.triton.model_ready(m.serve_name)}
     checks["models"] = bool(models) and all(v["ready"] for v in models.values())
     ok = all(checks.values())
     response.status_code = 200 if ok else 503

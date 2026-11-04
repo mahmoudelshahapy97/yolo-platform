@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     triton_url: str = "triton:8001"
     triton_http_url: str = "http://triton:8000"
     model_repository: Path = Path("/models")
+    # Generated per-version Triton models (<name>__v<version>); Triton serves this directory.
+    serving_repository: Path = Path("/serving")
+    # The source repository as Triton sees it (serving symlinks point into it).
+    triton_models_path: str = "/models"
 
     # Bootstrap admin key, created (or rotated) on start. Format yp_<prefix>_<secret>.
     admin_api_key: str = ""
@@ -32,6 +36,9 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_bucket: str = "yolo-platform"
     s3_region: str = "us-east-1"
+    # When set (e.g. "/storage"), presigned links are returned relative to the public
+    # entry point, which proxies them to object storage (deploy/nginx).
+    s3_public_prefix: str = ""
 
     triton_timeout_s: float = 10.0
     log_level: str = "INFO"

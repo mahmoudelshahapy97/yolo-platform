@@ -5,6 +5,7 @@
 # model_repository/<name>/<version>/model.plan plus config.pbtxt.
 #
 # class_names (optional) overrides the names stored in the weights.
+# instances (optional, default 1) is the number of engine copies Triton runs.
 #
 # max_batch is the largest batch the TensorRT profile accepts. Triton's
 # max_batch_size is set to the same value, never larger.
@@ -15,6 +16,9 @@ models:
     imgsz: 640
     max_batch: 16
     opt_batch: 8
+    # instances: 2 was benchmarked at 75 and 100 cameras and gave no gain (GPU and
+    # host CPU saturate together), so one engine copy it is.
+    instances: 1
   - name: people_detection
     weights: people.pt
     task: detect

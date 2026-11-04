@@ -1,0 +1,79 @@
+groups:
+  - name: inference
+    rules:
+      - alert: TritonDown
+        expr: up{job="triton"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Triton is not answering metrics scrapes"}
+      - alert: ApiDown
+        expr: absent(up{job="api"} == 1)
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "No API process is up"}
+      - alert: InferenceP95High
+        expr: histogram_quantile(0.95, sum by (le, model) (rate(inference_latency_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "p95 image inference latency for {{ $labels.model }} above 500 ms"}
+      - alert: InferenceErrors
+        expr: sum by (model, reason) (rate(inference_errors_total[5m])) > 0.1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.model }} failing ({{ $labels.reason }})"}
+      - alert: TritonQueueBacklog
+        expr: max by (model) (nv_inference_pending_request_count) > 100
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "Triton queue for {{ $labels.model }} above 100 requests"}
+      - alert: TritonRequestFailures
+        expr: sum by (model) (rate(nv_inference_request_failure[5m])) > 0.1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Triton rejecting or failing requests for {{ $labels.model }}"}
+  - name: cameras
+    rules:
+      - alert: ShardDown
+        expr: up{job="camera-shard"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Camera shard {{ $labels.instance }} down (its cameras fail over after the lease expires)"}
+      - alert: CameraDroppingFrames
+        expr: |
+          rate(camera_dropped_frames_total[5m])
+            / (rate(camera_dropped_frames_total[5m]) + rate(camera_inferred_frames_total[5m])) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Camera {{ $labels.camera }} drops >10% of sampled frames: inference cannot keep up"}
+      - alert: CameraNotStreaming
+        expr: camera_fps == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "Camera {{ $labels.camera }} is producing no inferred frames"}
+      - alert: FrameLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(frame_age_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "p95 decode-to-result latency above 1 s"}
+      - alert: EventsNotStored
+        expr: rate(events_failed_total[5m]) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Event processor cannot write events (they stay pending in Redis)"}
+  - name: gpu
+    rules:
+      - alert: GpuMemoryHigh
+        expr: DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE) > 0.9
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "GPU memory above 90%: no room for model reloads or new versions"}
+      - alert: GpuHot
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "GPU temperature above 85 C"}
+      - alert: NvdecSaturated
+        expr: DCGM_FI_DEV_DEC_UTIL > 90
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "NVDEC above 90%: move cameras to substreams or add a GPU"}

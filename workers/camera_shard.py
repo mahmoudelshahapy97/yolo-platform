@@ -35,7 +35,7 @@ from redis import Redis
 
 from yolo_platform_shared.camera_config import CameraConfig
 from yolo_platform_shared.decode import decode_detections
-from yolo_platform_shared.preprocess import LetterboxMeta, classify_crop, letterbox, scale_boxes
+from yolo_platform_shared.preprocess import LetterboxMeta, classify_crop, letterbox
 
 from .decode.base import FrameSource, Sample
 from .rules import Event, RulesEngine, TrackedObject, rule_by_name
@@ -156,7 +156,8 @@ class Shard:
             return
         rt.source.stop()
         self.redis.delete(f"camera:status:{cam_id}")
-        for metric in (M_FPS,):
+        # Drop the camera's series so label cardinality does not grow with camera churn.
+        for metric in (M_FPS, M_INFERRED, M_DROPPED, M_DECODED, M_RECONNECTS):
             try:
                 metric.remove(cam_id)
             except KeyError:
@@ -208,8 +209,8 @@ class Shard:
 
     def _pipeline(self, index: int) -> None:
         client = grpcclient.InferenceServerClient(self.s.triton_url)
-        slot = ShmSlot(client, SLOT_BATCH, DETECT_SIZE)
-        logger.info("pipeline %d ready", index)
+        slot = self._new_slot(client, index)
+        failures = 0
         try:
             while not self.stop.is_set():
                 groups = self._fresh_by_model()
@@ -233,12 +234,25 @@ class Shard:
                     continue
                 t0 = time.perf_counter()
                 try:
-                    out = slot.infer(model_name, model["version"], len(taken))
+                    out = slot.infer(model["serve_name"], 1, len(taken))
+                    failures = 0
                 except Exception as exc:
-                    M_ERRORS.labels(model_name, "overload" if is_overload(exc) else "error").inc()
+                    overload = is_overload(exc)
+                    M_ERRORS.labels(model_name, "overload" if overload else "error").inc()
                     logger.warning("pipeline %d: %s inference failed for %d frames: %s", index, model_name,
                                    len(taken), exc)
-                    time.sleep(0.1)
+                    failures += 0 if overload else 1
+                    if failures in (10, 30):
+                        # Triton restarted and forgot our shared-memory registration: register again.
+                        slot.close()
+                        slot = self._new_slot(client, index)
+                    elif failures >= 60:
+                        # Still failing (e.g. Triton came back in a new IPC namespace): let Docker
+                        # restart this shard; its leases expire and are re-claimed.
+                        logger.error("pipeline %d: %d consecutive failures; exiting so the shard restarts",
+                                     index, failures)
+                        os._exit(1)
+                    time.sleep(0.1 if overload else 0.5)
                     continue
                 M_INFER.labels(model_name).observe(time.perf_counter() - t0)
                 M_BATCH.labels(model_name).observe(len(taken))
@@ -252,6 +266,17 @@ class Shard:
         finally:
             slot.close()
             client.close()
+
+    def _new_slot(self, client, index: int) -> ShmSlot:
+        while not self.stop.is_set():
+            try:
+                slot = ShmSlot(client, SLOT_BATCH, DETECT_SIZE)
+                logger.info("pipeline %d ready (shared-memory slot %s)", index, slot.in_name)
+                return slot
+            except Exception as exc:
+                logger.warning("pipeline %d: cannot register shared memory with Triton yet: %s", index, exc)
+                time.sleep(2)
+        raise SystemExit(0)
 
     def _post(self, rt: CameraRuntime, sample: Sample, out: np.ndarray, frame: np.ndarray, model: dict,
               client) -> None:
@@ -307,7 +332,7 @@ class Shard:
             return []
         crop = classify_crop(np.ascontiguousarray(frame_lb[y1:y2, x1:x2, ::-1]), model["imgsz"])
         try:
-            probs = infer_plain(client, model_name, model["version"], crop[None])[0]
+            probs = infer_plain(client, model["serve_name"], 1, crop[None])[0]
         except Exception as exc:
             M_ERRORS.labels(model_name, "error").inc()
             logger.warning("classify %s failed: %s", model_name, exc)
@@ -350,7 +375,7 @@ class Shard:
                     # Different input size: re-letterbox the visible area of the 640 frame.
                     batch, metas = self._reletterbox(items, model["imgsz"])
                 try:
-                    out = np.concatenate([infer_plain(client, model_name, model["version"], batch[k:k + model["max_batch"]])
+                    out = np.concatenate([infer_plain(client, model["serve_name"], 1, batch[k:k + model["max_batch"]])
                                           for k in range(0, len(batch), model["max_batch"])])
                 except Exception as exc:
                     M_ERRORS.labels(model_name, "overload" if is_overload(exc) else "error").inc()

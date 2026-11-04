@@ -3,7 +3,6 @@
 import json
 import os
 import time
-import uuid
 
 import pytest
 from redis import Redis

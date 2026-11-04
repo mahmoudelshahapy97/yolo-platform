@@ -54,7 +54,8 @@ async def get_model(name: str, request: Request, p: Principal = Depends(require(
         "imgsz": versions[-1]["imgsz"],
         "max_batch": versions[-1]["max_batch"],
         "active_version": active.version if active else None,
-        "ready": await core.triton.model_ready(name, str(active.version)) if active else False,
+        "triton_model": active.serve_name if active else None,
+        "ready": await core.triton.model_ready(active.serve_name) if active else False,
         "classes": names,
         "versions": versions,
     }

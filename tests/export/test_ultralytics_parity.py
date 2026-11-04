@@ -10,7 +10,7 @@ import torch
 from ultralytics.data.augment import LetterBox, classify_transforms
 from ultralytics.utils import ops
 
-from yolo_platform_shared.preprocess import LetterboxMeta, classify_crop, letterbox, scale_boxes
+from yolo_platform_shared.preprocess import classify_crop, letterbox, scale_boxes
 
 
 @pytest.mark.parametrize("w,h", [(640, 480), (1920, 1080), (480, 360), (360, 640), (1281, 719), (2560, 1440)])

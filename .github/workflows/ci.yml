@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: docker compose config
+        run: |
+          cp .env.example .env
+          sed -i 's/^ADMIN_API_KEY=$/ADMIN_API_KEY=yp_ci000000_ci-secret/' .env
+          docker compose config -q
+          docker compose -f docker-compose.yml -f docker-compose.test.yml config -q
+
+      - name: Byte-compile
+        run: python3 -m compileall -q api/app workers shared tools inference
+
+      - name: Ruff
+        run: pipx run ruff==0.14.3 check --select E9,F63,F7,F82,F401 api workers shared tools inference tests
+
+      - name: Dashboard is generated from its script
+        run: |
+          python3 monitoring/gen_dashboard.py
+          git diff --exit-code monitoring/grafana/dashboards
+
+  # The runner has no GPU and no Triton: unit tests that need them skip themselves.
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7.4.6-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: API image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: api/Dockerfile
+          tags: yolo-platform-api:ci
+          load: true
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Worker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: workers/Dockerfile
+          tags: yolo-platform-worker:ci
+          load: true
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+
+      - name: Worker and shared unit tests
+        run: |
+          docker run --rm --network host -e HOME=/tmp -e TEST_REDIS_URL=redis://localhost:6379/15 \
+            -v "$PWD:/src:ro" -w /src --entrypoint sh yolo-platform-worker:ci -c \
+            "pip install -q --user -r workers/requirements-dev.txt && python -m pytest -q -p no:cacheprovider tests/unit --ignore=tests/unit/test_api_units.py"
+
+      - name: API unit tests
+        run: |
+          docker run --rm --network host -e HOME=/tmp -e TEST_REDIS_URL=redis://localhost:6379/15 \
+            -v "$PWD:/src:ro" -w /src --entrypoint sh yolo-platform-api:ci -c \
+            "pip install -q --user -r api/requirements-dev.txt && python -m pytest -q -p no:cacheprovider tests/unit/test_api_units.py tests/unit/test_shared.py"

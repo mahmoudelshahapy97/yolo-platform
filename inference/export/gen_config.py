@@ -50,14 +50,14 @@ dynamic_batching {{
 
 instance_group [
   {{
-    count: 1
+    count: {instances}
     kind: KIND_GPU
     gpus: [ 0 ]
   }}
 ]
 
-# Serve only the version the registry activates (explicit model control loads
-# versions deliberately; see api/app/services/model_registry.py).
+# The registry serves each version as its own Triton model (<name>__v<version>),
+# generated from this file; see api/app/services/model_registry.py.
 version_policy: {{ latest: {{ num_versions: 1 }} }}
 
 model_warmup [
@@ -89,7 +89,7 @@ def render(meta: dict, queue_delay_us: int = 3000, max_queue: int = 256, timeout
         out_type=DTYPES[out["dtype"]], out_dims=out_dims,
         label='label_filename: "labels.txt"' if meta["task"] == "classify" else "",
         preferred=preferred, queue_delay_us=queue_delay_us, max_queue=max_queue, timeout_us=timeout_us,
-        warm_batch=meta["opt_batch"], task=meta["task"],
+        warm_batch=meta["opt_batch"], task=meta["task"], instances=meta.get("instances", 1),
     )
 
 

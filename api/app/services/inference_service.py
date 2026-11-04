@@ -7,7 +7,7 @@ model-specific step (preprocess, decode, coordinates). Routes never see tensors.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -94,7 +94,7 @@ class InferenceService:
     async def _run(self, model: ActiveModel, batch: np.ndarray) -> np.ndarray:
         """Split into engine-sized chunks; Triton batches concurrent chunks itself."""
         chunks = [batch[i:i + model.max_batch] for i in range(0, len(batch), model.max_batch)]
-        outs = await asyncio.gather(*(self.triton.infer(model.name, model.version, c) for c in chunks))
+        outs = await asyncio.gather(*(self.triton.infer(model.serve_name, 1, c) for c in chunks))
         return np.concatenate(outs)
 
     async def detect(self, images: List[np.ndarray], model_name: str, conf: float = 0.25,

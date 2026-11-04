@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -27,8 +28,10 @@ async def lifespan(app: FastAPI):
     pool = await asyncpg.create_pool(s.database_url, min_size=2, max_size=20)
     redis = Redis.from_url(s.redis_url, decode_responses=True)
     triton = TritonClient(s.triton_url, s.triton_timeout_s)
-    registry = ModelRegistry(pool, redis, triton, s.model_repository)
-    storage = Storage(s.s3_endpoint, s.s3_access_key, s.s3_secret_key, s.s3_bucket, s.s3_region)
+    registry = ModelRegistry(pool, redis, triton, s.model_repository, s.serving_repository,
+                             triton_models_path=s.triton_models_path)
+    storage = Storage(s.s3_endpoint, s.s3_access_key, s.s3_secret_key, s.s3_bucket, s.s3_region,
+                      public_prefix=s.s3_public_prefix)
     core = AppState(settings=s, pool=pool, redis=redis, triton=triton, registry=registry,
                     inference=InferenceService(triton, registry), keys=KeyStore(pool), limiter=RateLimiter(redis),
                     storage=storage)
@@ -43,7 +46,9 @@ async def lifespan(app: FastAPI):
         await storage.ensure_bucket()
     except Exception as exc:  # storage is needed for video jobs only
         logger.warning("object storage not reachable: %s", exc)
+    watchdog = asyncio.create_task(registry.watchdog())
     yield
+    watchdog.cancel()
     await triton.close()
     await redis.aclose()
     await pool.close()

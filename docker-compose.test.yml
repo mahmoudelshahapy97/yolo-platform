@@ -1,0 +1,21 @@
+# Scratch-stack overrides for tools/e2e.sh (project yp-test): no host ports, a copy of
+# the model repository (the rollout tests add versions), fast job retries, the test
+# RTSP rig always on, and one shard + one video worker.
+services:
+  minio: {ports: !reset []}
+  nginx: {ports: !reset []}
+  grafana: {ports: !reset []}
+  prometheus: {ports: !reset []}
+  mediamtx:
+    profiles: !reset []
+    ports: !reset []
+  camera-shard:
+    deploy:
+      replicas: 1
+  video-worker:
+    environment:
+      JOB_CLAIM_IDLE_SECONDS: "10"
+  backup:
+    profiles: ["never"]
+  dcgm-exporter:
+    profiles: ["never"]

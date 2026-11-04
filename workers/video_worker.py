@@ -214,7 +214,7 @@ class Worker:
                     if not pending:
                         return
                     lbs = [letterbox(f, size) for _, f in pending]
-                    out = infer_plain(self.triton, model_name, model["version"], np.stack([lb for lb, _ in lbs]))
+                    out = infer_plain(self.triton, model["serve_name"], 1, np.stack([lb for lb, _ in lbs]))
                     for (fi, frame), (_, meta), o in zip(pending, lbs, out):
                         dets = decode_detections(o, meta, names, conf=min(conf, 0.1) if tracker else conf)
                         tids = {}
