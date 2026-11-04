@@ -9,8 +9,8 @@ NVDEC session.
 
 Every source in a shard shares the shard's one CUDA context (the primary
 context, owned by CuPy), so a camera costs a decoder session and a few MB of
-VRAM, not a CUDA context of its own. Decoded frames stay on the GPU: due frames
-are letterboxed by a CUDA kernel into the camera's device slot, and only the
+VRAM, not a CUDA context of its own. Decoded frames stay on the GPU as NV12: due
+frames are converted to RGB and letterboxed by one CUDA kernel into the camera's device slot, and only the
 640x640 model input crosses to the host (into the Triton shared-memory slot).
 """
 
@@ -23,7 +23,7 @@ import numpy as np
 import PyNvVideoCodec as nvc
 from cupy_backends.cuda.api import driver
 
-from ..gpu_prep import letterbox_gpu
+from ..gpu_prep import nv12_letterbox_gpu
 from .base import FrameSource
 
 _CTX_LOCK = threading.Lock()
@@ -43,12 +43,10 @@ def shard_context() -> int:
         return _CTX
 
 
-def frame_as_cupy(frame) -> cp.ndarray:
-    """Zero-copy view of a decoded RGB frame (valid until the decoder reuses the surface)."""
-    cai = frame.cuda()[0].__cuda_array_interface__
-    shape, strides = tuple(cai["shape"]), tuple(cai["strides"])
-    mem = cp.cuda.UnownedMemory(cai["data"][0], shape[0] * strides[0], owner=frame)
-    return cp.ndarray(shape, cp.uint8, cp.cuda.MemoryPointer(mem, 0), strides=strides)
+def nv12_planes(frame):
+    """(y_ptr, y_pitch, uv_ptr, uv_pitch, width, height) of a decoded NV12 surface."""
+    y, uv = (p.__cuda_array_interface__ for p in frame.cuda())
+    return y["data"][0], y["strides"][0], uv["data"][0], uv["strides"][0], y["shape"][1], y["shape"][0]
 
 
 class AnnexB:
@@ -94,9 +92,13 @@ class NvdecSource(FrameSource):
                 raise ValueError(f"codec {name} is not supported by the NVDEC backend (h264, hevc)")
             self.stats.width, self.stats.height, self.stats.codec = vs.codec_context.width, vs.codec_context.height, name
             to_annexb = AnnexB(vs)
+            cc = vs.codec_context
+            # AVCOL_SPC_BT709 = 1; AVCOL_RANGE_JPEG = 2. Unknown -> BT.601 limited, as FFmpeg assumes.
+            bt709 = int(getattr(cc, "colorspace", 0) or 0) == 1 or (int(getattr(cc, "colorspace", 0) or 0) == 2 and cc.height >= 720)
+            full_range = int(getattr(cc, "color_range", 0) or 0) == 2
             decoder = nvc.CreateDecoder(gpuid=0, codec=CODECS[name], cudacontext=self._ctx,
                                         cudastream=self._stream_obj.ptr, usedevicememory=True,
-                                        outputColorType=nvc.OutputColorType.RGB,
+                                        outputColorType=nvc.OutputColorType.NATIVE,
                                         latency=nvc.DisplayDecodeLatencyType.LOW)
             pace = 1.0 / float(vs.average_rate or 25) if is_file else 0.0
             got_any = False
@@ -117,8 +119,9 @@ class NvdecSource(FrameSource):
                         self.stats.last_frame_at = now
                         self._mark_streaming()
                         if self._due(now):
-                            meta = letterbox_gpu(frame_as_cupy(frame), self.size, self._bufs[self.back],
-                                                 self._stream_obj)
+                            y_ptr, y_pitch, uv_ptr, uv_pitch, w, h = nv12_planes(frame)
+                            meta = nv12_letterbox_gpu(y_ptr, y_pitch, uv_ptr, uv_pitch, w, h, self.size,
+                                                      self._bufs[self.back], self._stream_obj, bt709, full_range)
                             self._stream_obj.synchronize()   # the surface is reused by the next Decode
                             self._publish(meta, now)
                 if pace:
