@@ -4,6 +4,8 @@
 # export_onnx.py -> wrap_uint8.py -> build_plan.sh, which produces
 # model_repository/<name>/<version>/model.plan plus config.pbtxt.
 #
+# class_names (optional) overrides the names stored in the weights.
+#
 # max_batch is the largest batch the TensorRT profile accepts. Triton's
 # max_batch_size is set to the same value, never larger.
 models:
@@ -25,6 +27,9 @@ models:
     imgsz: 640
     max_batch: 16
     opt_batch: 4
+    # The weights carry no class names ("0", "1", "2"). fire&smoke maps 0 and 1;
+    # class 2 is unnamed there too.
+    class_names: {0: fire, 1: smoke, 2: class_2}
   - name: ppe_detection
     weights: ppe_yolov8m.pt
     task: detect

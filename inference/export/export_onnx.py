@@ -50,6 +50,8 @@ def export_one(spec: dict, out_root: Path) -> dict:
     weights = ROOT / "weights" / spec["weights"]
     model = YOLO(str(weights))
     info = inspect(model)
+    if spec.get("class_names"):
+        info["names"].update({int(k): str(v) for k, v in spec["class_names"].items()})
     if info["task"] != spec["task"]:
         raise SystemExit(f"{spec['name']}: models.yaml says {spec['task']}, weights are {info['task']}")
 
@@ -70,7 +72,7 @@ def export_one(spec: dict, out_root: Path) -> dict:
 
     graph = onnx.load(str(target)).graph
     meta = {
-        **spec,
+        **{k: v for k, v in spec.items() if k != "class_names"},
         **info,
         "embedded_nms": embedded_nms,
         "end2end": info["task"] == "detect",
