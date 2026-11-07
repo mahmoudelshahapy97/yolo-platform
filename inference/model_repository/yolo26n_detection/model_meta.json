@@ -89,5 +89,25 @@
   "weights": "yolo26n.pt",
   "architecture": "DetectionModel",
   "embedded_nms": true,
-  "end2end": true
+  "end2end": true,
+  "input": {
+    "name": "images",
+    "dtype": "UINT8",
+    "dims": [
+      640,
+      640,
+      3
+    ]
+  },
+  "precision": "fp16",
+  "framework": "ultralytics",
+  "outputs": [
+    {
+      "name": "output0",
+      "shape": [
+        300,
+        6
+      ]
+    }
+  ]
 }

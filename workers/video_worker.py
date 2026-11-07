@@ -10,8 +10,9 @@ Durability:
   - each start increments job.attempts; after MAX_ATTEMPTS the job is failed and
     the entry is copied to the dead-letter stream ``jobs:video:dead``.
 
-Output: ``jobs/<id>/detections.jsonl`` (one line per sampled frame), a summary
-in job.summary, and with annotate=true ``jobs/<id>/annotated.mp4`` (H.264).
+Output: ``jobs/<id>/detections.jsonl`` (one line per sampled frame; pose models add
+``keypoints``, segmentation models ``polygon`` to each detection), a summary in
+job.summary, and with annotate=true ``jobs/<id>/annotated.mp4`` (H.264).
 """
 
 import json
@@ -36,11 +37,11 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from redis import Redis
 from redis.exceptions import ResponseError
 
-from yolo_platform_shared.decode import decode_detections
+from yolo_platform_shared.decode import decode_detections, decode_pose, decode_segment
 from yolo_platform_shared.preprocess import letterbox
 
 from .tracking import ByteTracker
-from .triton_io import ActiveModels, infer_plain
+from .triton_io import ActiveModels, infer_outputs, model_outputs
 
 logger = logging.getLogger("video-worker")
 
@@ -53,6 +54,11 @@ M_JOBS = Counter("video_jobs_total", "Video jobs finished", ["status"])
 M_FRAMES = Counter("video_job_frames_total", "Frames inferred for video jobs")
 M_ACTIVE = Gauge("video_jobs_active", "Jobs being processed by this worker")
 M_SECONDS = Histogram("video_job_seconds", "Job wall time", buckets=(1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600))
+
+# COCO-17 skeleton (keypoint index pairs), as Ultralytics draws it.
+SKELETON = [(15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11), (6, 12), (5, 6), (5, 7), (6, 8), (7, 9),
+            (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6)]
+KPT_DRAW_CONF = 0.5
 
 PALETTE = [(56, 56, 255), (151, 157, 255), (31, 112, 255), (29, 178, 255), (49, 210, 207), (10, 249, 72),
            (23, 204, 146), (134, 219, 61), (52, 147, 26), (187, 212, 0), (168, 153, 44), (255, 194, 0)]
@@ -185,6 +191,8 @@ class Worker:
     def _process(self, job_id: str, model_name: str, params: dict, input_key: str) -> dict:
         model = self.models.get(model_name) or self.models.wait_for(model_name, timeout=60)
         size, names, max_batch = model["imgsz"], model["names"], model["max_batch"]
+        task = model.get("task", "detect")
+        kpt_shape = tuple(model.get("kpt_shape") or (17, 3))
         sample_fps, conf = float(params.get("sample_fps", 5)), float(params.get("conf", 0.25))
         annotate, track = bool(params.get("annotate")), bool(params.get("track", True))
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,9 +222,20 @@ class Worker:
                     if not pending:
                         return
                     lbs = [letterbox(f, size) for _, f in pending]
-                    out = infer_plain(self.triton, model["serve_name"], 1, np.stack([lb for lb, _ in lbs]))
-                    for (fi, frame), (_, meta), o in zip(pending, lbs, out):
-                        dets = decode_detections(o, meta, names, conf=min(conf, 0.1) if tracker else conf)
+                    outs = infer_outputs(self.triton, model["serve_name"], 1, np.stack([lb for lb, _ in lbs]),
+                                         model_outputs(model), timeout_s=30.0)
+                    for k, ((fi, frame), (_, meta), o) in enumerate(zip(pending, lbs, outs[0])):
+                        low = min(conf, 0.1) if tracker else conf
+                        if task == "pose":
+                            dets = decode_pose(o, meta, names, kpt_shape, conf=low)
+                        else:
+                            dets = decode_detections(o, meta, names, conf=low)
+                        if task == "segment":
+                            # Masks only for the detections that are reported (conf >= conf). Both lists are
+                            # the same rows sorted by confidence, so they are the first len(segs) of ``dets``.
+                            segs = decode_segment(o, outs[1][k], meta, names, size, conf=conf)
+                            for d, sd in zip(dets, segs):
+                                d.polygon = sd.polygon
                         tids = {}
                         if tracker:
                             b = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32).reshape(-1, 4)
@@ -268,7 +287,7 @@ class Worker:
             self.s3.upload_file(str(results_path), self.bucket, result_key, ExtraArgs={"ContentType": "application/x-ndjson"})
             self._progress(job_id, processed)
         summary = {"frames_processed": processed, "video_fps": round(fps, 3), "sample_every_n_frames": step,
-                   "width": w, "height": h, "model": model_name, "model_version": model["version"],
+                   "width": w, "height": h, "model": model_name, "model_version": model["version"], "task": task,
                    "detections_by_class": dict(counts),
                    "unique_tracks_by_class": {k: len(v) for k, v in track_ids.items()} if track else None}
         return {"summary": summary, "result_key": result_key, "output_key": output_key}
@@ -291,6 +310,29 @@ class Worker:
 
     @staticmethod
     def _draw(frame: np.ndarray, dets: list) -> None:
+        polys = [(d, np.array(d["polygon"], dtype=np.int32)) for d in dets if len(d.get("polygon") or []) >= 3]
+        if polys:
+            overlay = frame.copy()
+            for d, pts in polys:
+                color = PALETTE[(d.get("track_id") or d["class_id"]) % len(PALETTE)]
+                cv2.fillPoly(overlay, [pts], color)
+            cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, dst=frame)
+            for d, pts in polys:
+                color = PALETTE[(d.get("track_id") or d["class_id"]) % len(PALETTE)]
+                cv2.polylines(frame, [pts], True, color, 2, cv2.LINE_AA)
+        for d in dets:
+            kp = d.get("keypoints")
+            if not kp:
+                continue
+            color = PALETTE[(d.get("track_id") or d["class_id"]) % len(PALETTE)]
+            pts = [(int(x), int(y)) if c >= KPT_DRAW_CONF else None for x, y, c in kp]
+            if len(pts) == 17:
+                for a, b in SKELETON:
+                    if pts[a] and pts[b]:
+                        cv2.line(frame, pts[a], pts[b], color, 2, cv2.LINE_AA)
+            for p in pts:
+                if p:
+                    cv2.circle(frame, p, 3, (255, 255, 255), -1, cv2.LINE_AA)
         for d in dets:
             b = d["bbox"]
             color = PALETTE[(d.get("track_id") or d["class_id"]) % len(PALETTE)]

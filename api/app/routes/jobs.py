@@ -51,8 +51,9 @@ async def submit_video(
     core = state(request)
     check_model(p, model)
     active = await core.registry.active(model)
-    if active is None or active.task != "detect":
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"'{model}' is not a serving detection model")
+    if active is None or active.task not in ("detect", "pose", "segment"):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"'{model}' is not a serving detection, pose or segmentation model")
     if (file.content_type or "application/octet-stream") not in VIDEO_TYPES:
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, f"unsupported content type {file.content_type}")
     backlog = await core.pool.fetchval("SELECT count(*) FROM job WHERE status = 'queued'")

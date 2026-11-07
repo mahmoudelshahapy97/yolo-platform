@@ -11,7 +11,12 @@ Layout of one shard process (one CUDA context for all of it):
   post-processing (inline)       decode -> per-camera ByteTrack -> rules -> events
            |                     classify crops / queue triggered models
   triggered-model thread         fire / PPE / ... on a schedule or when a rule fires
+  behaviour thread               pose cameras with ``shoplifting``: judges people's pose windows
+                                 with the sequence model (shared/yolo_platform_shared/behavior.py)
   control loop (main thread)     leases (scheduler.py), config changes, status, heartbeats
+
+The primary model is a detector or a pose model (its rows carry 17 keypoints; the
+shared-memory output region is sized for those).
 
 Events go to the Redis Stream ``events`` (the event processor stores them).
 Status goes to ``camera:status:<id>`` every 2 s; metrics on :9100/metrics.
@@ -33,15 +38,16 @@ import tritonclient.grpc as grpcclient
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from redis import Redis
 
+from yolo_platform_shared.behavior import SHOPLIFTING_CLASS, Person, ShopliftingParams, ShopliftingTracker, keypoints_xyn
 from yolo_platform_shared.camera_config import CameraConfig
-from yolo_platform_shared.decode import decode_detections
+from yolo_platform_shared.decode import decode_detections, decode_pose
 from yolo_platform_shared.preprocess import LetterboxMeta, classify_crop, letterbox
 
 from .decode.base import FrameSource, Sample
 from .rules import Event, RulesEngine, TrackedObject, rule_by_name
 from .scheduler import LeaseScheduler
 from .tracking import ByteTracker
-from .triton_io import ActiveModels, ShmSlot, infer_plain, is_overload
+from .triton_io import ActiveModels, ShmSlot, infer_plain, is_overload, model_input_name, model_outputs
 
 logger = logging.getLogger("shard")
 
@@ -49,6 +55,7 @@ EVENT_STREAM = "events"
 EVENT_STREAM_MAXLEN = 500_000
 DETECT_SIZE = 640
 SLOT_BATCH = 16
+PRIMARY_TASKS = ("detect", "pose")
 
 # ---------------- metrics ----------------
 M_ACTIVE = Gauge("active_cameras", "Cameras owned by this shard", ["shard"])
@@ -68,6 +75,8 @@ M_EVENTS = Counter("events_total", "Events emitted", ["type"])
 M_ERRORS = Counter("shard_infer_errors_total", "Failed Triton requests", ["model", "reason"])
 M_TRIGGERED = Counter("triggered_inferences_total", "Triggered-model inferences", ["model"])
 M_TRIG_DROP = Counter("triggered_dropped_total", "Triggered-model requests dropped (queue full)", ["model"])
+M_BEHAVIOR = Counter("behavior_windows_total", "Pose windows judged by a sequence model", ["model"])
+M_BEHAVIOR_DROP = Counter("behavior_dropped_total", "Pose windows dropped before judging (queue full)", ["model"])
 
 
 @dataclass
@@ -81,6 +90,23 @@ class Settings:
     shard_id: str = os.environ.get("SHARD_ID") or f"{socket.gethostname()}-{os.getpid()}"
     lease_ms: int = int(os.environ.get("LEASE_MS", "15000"))
     stall_s: float = float(os.environ.get("STALL_SECONDS", "20"))
+
+
+def out_cols(model: dict) -> int:
+    """Row width of a box model's output: 6, plus K*3 keypoint values for pose."""
+    if model.get("task") == "pose":
+        k, d = model.get("kpt_shape") or (17, 3)
+        return 6 + k * d
+    return 6
+
+
+def shoplifting_params(config: CameraConfig) -> Optional[ShopliftingParams]:
+    c = config.shoplifting
+    if c is None:
+        return None
+    return ShopliftingParams(sample_fps=c.sample_fps, threshold=c.threshold, smooth_window=c.smooth_window,
+                             min_window_samples=c.min_window_samples, min_person_height_px=c.min_person_height_px,
+                             track_cooldown_s=c.track_cooldown_s, camera_cooldown_s=c.camera_cooldown_s)
 
 
 def make_source(backend: str, camera_id: str, url: str, fps: float) -> FrameSource:
@@ -106,6 +132,7 @@ class CameraRuntime:
     trig_cooldown: Dict[Tuple[str, str], float] = field(default_factory=dict)
     last_events: int = 0
     seen: Dict[str, int] = field(default_factory=lambda: {"decoded": 0, "dropped": 0, "reconnects": 0})
+    shoplifting: Optional[ShopliftingTracker] = None
 
     @property
     def model(self) -> str:
@@ -125,6 +152,14 @@ class TriggeredJob:
     cooldown_s: float
 
 
+@dataclass
+class BehaviorJob:
+    camera: CameraRuntime
+    model: str
+    windows: List[Tuple[int, np.ndarray]]   # (track_id, [120, 17, 12] features)
+    ts: float
+
+
 class Shard:
     def __init__(self, s: Settings) -> None:
         self.s = s
@@ -135,6 +170,7 @@ class Shard:
         self.cam_lock = threading.Lock()
         self.stop = threading.Event()
         self.triggered: "queue.Queue[TriggeredJob]" = queue.Queue(maxsize=256)
+        self.behavior: "queue.Queue[BehaviorJob]" = queue.Queue(maxsize=256)
         self._rr = 0
 
     # ---------------- camera lifecycle ----------------
@@ -144,6 +180,8 @@ class Shard:
         fps = float(spec.get("target_fps", 5))
         src = make_source(self.s.backend, cam_id, spec["url"], fps)
         rt = CameraRuntime(cam_id, spec, config, src, ByteTracker(frame_rate=fps), RulesEngine(config))
+        params = shoplifting_params(config)
+        rt.shoplifting = ShopliftingTracker(params) if params else None
         with self.cam_lock:
             self.cameras[cam_id] = rt
         src.start()
@@ -178,6 +216,13 @@ class Shard:
             with rt.lock:
                 rt.spec, rt.config = spec, config
                 rt.rules = RulesEngine(config)
+                params = shoplifting_params(config)
+                if params is None:
+                    rt.shoplifting = None
+                elif rt.shoplifting is None:
+                    rt.shoplifting = ShopliftingTracker(params)
+                else:
+                    rt.shoplifting.set_params(params)   # keep people's windows
                 rt.source.set_fps(float(spec["target_fps"]))
                 rt.tracker.set_frame_rate(float(spec["target_fps"]))
             logger.info("camera %s: config updated", cam_id)
@@ -219,7 +264,7 @@ class Shard:
                     continue
                 model_name, cams = max(groups.items(), key=lambda kv: len(kv[1]))
                 model = self.models.get(model_name)
-                if model is None or model["imgsz"] != DETECT_SIZE:
+                if model is None or model["imgsz"] != DETECT_SIZE or model.get("task", "detect") not in PRIMARY_TASKS:
                     time.sleep(0.05)
                     continue
                 batch_max = min(SLOT_BATCH, model["max_batch"])
@@ -234,7 +279,7 @@ class Shard:
                     continue
                 t0 = time.perf_counter()
                 try:
-                    out = slot.infer(model["serve_name"], 1, len(taken))
+                    out = slot.infer(model["serve_name"], 1, len(taken), out_cols=out_cols(model))
                     failures = 0
                 except Exception as exc:
                     overload = is_overload(exc)
@@ -289,21 +334,38 @@ class Shard:
             if config.classes:
                 wanted = set(config.classes)
                 keep = [i for i, n in names.items() if n in wanted]
-            dets = decode_detections(out, sample.meta, names, conf=min(config.detect_confidence, 0.1), classes=keep)
+            low = min(config.detect_confidence, 0.1)
+            if model.get("task") == "pose":
+                dets = decode_pose(out, sample.meta, names, tuple(model.get("kpt_shape") or (17, 3)), conf=low,
+                                   classes=keep)
+            else:
+                dets = decode_detections(out, sample.meta, names, conf=low, classes=keep)
             # ByteTrack wants the low-confidence detections too (second association stage).
             boxes = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32).reshape(-1, 4)
             scores = np.array([d.confidence for d in dets], dtype=np.float32)
             cls = np.array([d.class_id for d in dets], dtype=np.int64)
             matches = rt.tracker.update(boxes, scores, cls)
             objects = [TrackedObject(tid, dets[di].class_name, dets[di].confidence,
-                                     (dets[di].x1, dets[di].y1, dets[di].x2, dets[di].y2))
+                                     (dets[di].x1, dets[di].y1, dets[di].x2, dets[di].y2), dets[di].keypoints)
                        for di, tid in matches if dets[di].confidence >= config.detect_confidence]
             events = rt.rules.evaluate(objects, sample.meta.orig_w, sample.meta.orig_h, sample.ts)
+            due = []
+            if rt.shoplifting is not None and config.shoplifting is not None:
+                w, h = sample.meta.orig_w, sample.meta.orig_h
+                people = [Person(o.track_id, o.box, keypoints_xyn(o.keypoints, w, h), o.confidence)
+                          for o in objects if o.keypoints is not None
+                          and o.confidence >= config.shoplifting.min_confidence]
+                due = rt.shoplifting.update(people, sample.ts)
             rt.inferred += 1
             rt.fps_window.append((now, rt.inferred))
             while rt.fps_window and now - rt.fps_window[0][0] > 10:
                 rt.fps_window.pop(0)
         M_INFERRED.labels(rt.id).inc()
+        if due:
+            try:
+                self.behavior.put_nowait(BehaviorJob(rt, config.shoplifting.model, due, sample.ts))
+            except queue.Full:
+                M_BEHAVIOR_DROP.labels(config.shoplifting.model).inc(len(due))
 
         for ev in events:
             rule = rule_by_name(config, ev.rule)
@@ -367,7 +429,7 @@ class Shard:
                 by_model.setdefault(j.model, []).append(j)
             for model_name, items in by_model.items():
                 model = self.models.get(model_name)
-                if model is None or model["task"] != "detect":
+                if model is None or model["task"] not in PRIMARY_TASKS:
                     continue
                 if model["imgsz"] == DETECT_SIZE:
                     batch, metas = np.stack([j.frame for j in items]), [j.meta for j in items]
@@ -384,6 +446,57 @@ class Shard:
                 M_TRIGGERED.labels(model_name).inc(len(items))
                 for j, o, m in zip(items, out, metas):
                     self._triggered_events(j, model, o, m)
+        client.close()
+
+    def _behavior_loop(self) -> None:
+        """Judge pose windows with the camera's sequence model, batched across cameras."""
+        client = grpcclient.InferenceServerClient(self.s.triton_url)
+        while not self.stop.is_set():
+            try:
+                first = self.behavior.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            jobs = [first]
+            while len(jobs) < 32:
+                try:
+                    jobs.append(self.behavior.get_nowait())
+                except queue.Empty:
+                    break
+            by_model: Dict[str, List[BehaviorJob]] = {}
+            for j in jobs:
+                by_model.setdefault(j.model, []).append(j)
+            for model_name, items in by_model.items():
+                model = self.models.get(model_name)
+                if model is None or model.get("task") != "sequence":
+                    M_BEHAVIOR_DROP.labels(model_name).inc(sum(len(j.windows) for j in items))
+                    continue
+                owners = [(j, tid) for j in items for tid, _ in j.windows]
+                batch = np.stack([w for j in items for _, w in j.windows]).astype(np.float32)
+                try:
+                    probs = np.concatenate([
+                        infer_plain(client, model["serve_name"], 1, batch[k:k + model["max_batch"]],
+                                    input_name=model_input_name(model), output=model_outputs(model)[0])
+                        for k in range(0, len(batch), model["max_batch"])])
+                except Exception as exc:
+                    M_ERRORS.labels(model_name, "overload" if is_overload(exc) else "error").inc()
+                    logger.warning("behaviour %s failed for %d windows: %s", model_name, len(batch), exc)
+                    continue
+                M_BEHAVIOR.labels(model_name).inc(len(batch))
+                for (j, tid), p in zip(owners, probs):
+                    rt = j.camera
+                    with rt.lock:
+                        if rt.shoplifting is None:
+                            continue
+                        alert = rt.shoplifting.judge(tid, float(p[SHOPLIFTING_CLASS]), j.ts)
+                    if alert is None:
+                        continue
+                    self._emit(rt, Event(
+                        rule="shoplifting", type="shoplifting", ts=j.ts, track_id=alert.track_id, class_name="person",
+                        confidence=alert.probability, box=alert.box,
+                        data={"probability": round(alert.probability, 4), "peak": round(alert.peak, 4),
+                              "model": model_name, "model_version": model["version"],
+                              "window_samples": alert.real_samples, "alert": alert.alerts,
+                              "tracked_s": round(alert.ts - alert.first_seen, 1)}))
         client.close()
 
     @staticmethod
@@ -465,6 +578,7 @@ class Shard:
         threads = [threading.Thread(target=self._pipeline, args=(i,), name=f"pipe-{i}", daemon=True)
                    for i in range(self.s.pipelines)]
         threads.append(threading.Thread(target=self._triggered_loop, name="triggered", daemon=True))
+        threads.append(threading.Thread(target=self._behavior_loop, name="behavior", daemon=True))
         for t in threads:
             t.start()
         logger.info("shard %s up: backend=%s max_cameras=%d pipelines=%d", self.s.shard_id, self.s.backend,

@@ -25,10 +25,27 @@ gated model rollouts and Prometheus/Grafana monitoring.
 | `fire_detection` | fire.pt | detect (fire, smoke, class_2) | 640 | the weights carry no names; 0/1 follow fire&smoke |
 | `ppe_detection` | ppe_yolov8m.pt | detect (14 PPE classes) | 640 | YOLOv8 head, NMS embedded at export |
 | `yolo26n_cls` | yolo26n-cls.pt | classify (ImageNet 1000) | 224 | for crops: an ImageNet classifier, not a person-attribute model |
+| `gender_detection` | gender.pt | detect (female, male, child) | 640 | InsightEye's production gender model |
+| `gender0_detection` | gender0.pt | detect (female, male) | 640 | InsightEye's older 2-class model; no names in the weights, InsightEye counts 0 = female, 1 = male |
+| `yolo26l_detection` | yolo26l.pt | detect (80 COCO classes) | 640 | large: more accurate, much more GPU time per frame than yolo26n |
+| `yolo26m_pose` | yolo26m-pose.pt | pose (person + 17 COCO keypoints) | 640 | camera model for `shoplifting` |
+| `yolo26n_seg` | yolo26n-seg.pt | segment (80 COCO classes) | 640 | masks returned as polygons |
+| `yolo11n_seg` | yolo11n-seg.pt | segment (80 COCO classes) | 640 | YOLO11 head, NMS embedded at export |
+| `shoplifting_seq` | shoplifting.pt | sequence (Normal, Shoplifting) | 120×17×12 FP32 | InsightEye's Conv1d → BiGRU → attention net over one person's pose window; FP32 engine |
 
-Every detector has the same end-to-end output `[N, 300, 6]` (x1 y1 x2 y2 conf class). Each
-engine takes **UINT8 NHWC RGB** input: normalisation and the transpose run on the GPU, inside
-the engine. FP16 engines need about 1 GB of VRAM for all five models together.
+The last seven come from InsightEye (`/home/ubuntu/insighteye/models`). Its fire.pt, people.pt and
+yolo26n.pt are the same files as `fire_detection`, `people_detection` and `yolo26n_detection`.
+
+Every box model has an end-to-end output `[N, 300, 6 + extras]` (x1 y1 x2 y2 conf class, NMS in the
+engine): pose adds 17 × (x, y, conf), segmentation adds 32 mask coefficients plus a second output
+with the mask prototypes `[N, 32, 160, 160]`. Each image engine takes **UINT8 NHWC RGB** input:
+normalisation and the transpose run on the GPU, inside the engine. The sequence engine takes FP32
+feature windows (`shared/yolo_platform_shared/behavior.py`) and z-scores and softmaxes inside the engine.
+All twelve engines together take about 3 GB of VRAM in Triton (measured on the T4).
+
+The FP16 engines' embedded NMS occasionally keeps a near-identical second box of the same
+class (IoU above 0.9; the FP32 graph never does). Decoding therefore suppresses boxes again,
+class-aware at IoU 0.7 (Ultralytics' default), and the rollout gate measures the same rows.
 
 ## Quick start
 
@@ -68,6 +85,7 @@ Swagger is at `/docs`. `/health/ready` and `/v1/models/{name}` also name the Tri
 | GET | `/v1/models`, `/v1/models/{name}` | infer | versions, status, gate reports, classes |
 | POST | `/v1/infer/images` | infer | `file`, `model`, `conf`, `classes`, `max_det`, `classify_model`, `classify_classes`, `top_k` |
 | POST | `/v1/infer/batch` | infer | `files` (≤ 32), same options; one rate-limit token per image |
+| POST | `/v1/infer/sequences` | infer | JSON: `model`, `keypoints` (≤ 64 windows of ≤ 120 × 17 × [x, y], normalised) or `features`; one token per window |
 | POST | `/v1/infer/videos` | jobs | upload (≤ 2 GB), `model`, `sample_fps`, `conf`, `annotate`, `track` → `202 {job_id}` |
 | GET | `/v1/jobs`, `/v1/jobs/{id}` | jobs | progress, summary, `result_url` (JSONL), `output_url` (MP4) |
 | POST | `/v1/jobs/{id}/cancel` | jobs | |
@@ -96,6 +114,22 @@ Response (abridged):
     "classification": [{"class_id": 439, "class_name": "bearskin", "confidence": 0.12}]}]}]}
 ```
 
+Pose models add `"keypoints": [[x, y, conf], …]` (17, image pixels) to each detection, and
+segmentation models add `"polygon": [[x, y], …]`: the outline of the largest region of the
+instance mask, in image pixels. The mask is computed as Ultralytics does (prototype logits
+upsampled bilinearly to the input size, cropped to the box, > 0).
+
+Sequences: one window is one person's pose over time, oldest sample first, keypoints normalised
+to the frame (`null` for a sample where the person was not seen). The server builds the
+features exactly as cameras do and left-pads windows shorter than 120 samples.
+
+```bash
+curl -k -H "X-API-Key: $KEY" -H 'Content-Type: application/json' https://localhost:8443/v1/infer/sequences \
+  -d '{"model": "shoplifting_seq", "keypoints": [[ [[0.51,0.32], …17 points…], null, … ]]}'
+# {"task": "sequence", "results": [{"index": 0, "class_name": "Normal", "confidence": 0.97,
+#   "probabilities": {"Normal": 0.97, "Shoplifting": 0.03}}], …}
+```
+
 Limits:
 - 10 MB and 64 MP per image, 32 images per batch.
 - The pixel check reads the image header before decoding, so decompression bombs are rejected.
@@ -122,6 +156,20 @@ Limits:
 - **Primary detector:** runs on every sampled frame. Its output goes through one ByteTrack per camera and then the rules, each rule with its own cooldown.
 - **Triggered models:** run only when due (`every_s`) or when a rule fires (`on_rule`), so the GPU is not spent on every model for every frame.
 - **Config changes:** a change to `config` or `target_fps` is hot-swapped without reconnecting. A change to `url` or `model` restarts that camera's reader.
+- **Camera models:** a detection or a pose model at 640 px. Segmentation is offered for images and video jobs only: per frame its mask prototypes are larger than the frame.
+
+**Shoplifting** (pose camera model only), ported from InsightEye through the standalone shoplifting app:
+
+```json
+{"name": "aisle-4", "url": "rtsp://…", "target_fps": 5, "model": "yolo26m_pose",
+ "config": {"shoplifting": {"threshold": 0.5, "sample_fps": 3, "smooth_window": 3, "min_window_samples": 30,
+                            "min_person_height_px": 60, "track_cooldown_s": 300, "camera_cooldown_s": 30}}}
+```
+
+- Every tracked person has their own window of 120 pose samples (40 s at `sample_fps` 3, as trained); a lost person gets empty rows, and a new track id that appears within 5 s of someone vanishing, with a similar height, takes over that person's window.
+- Once a window has `min_window_samples` real samples, each new sample is judged by `shoplifting_seq` on a separate thread, batched across the shard's cameras. The probability is averaged over the last `smooth_window` judgements.
+- At `threshold` the shard emits an event of type `shoplifting` (`data`: probability, peak, window samples), at most once per person per `track_cooldown_s` and once per camera per `camera_cooldown_s`. InsightEye ran its threshold at 0.15; 0.5 is the class boundary.
+- `rules` and `triggered` models work on a pose camera as on a detector (on the person boxes).
 
 **Use the camera's substream** (e.g. 640×360 or D1) wherever its resolution is enough for detection.
 The detector sees 640×640 either way, and NVDEC and network costs grow with the stream's pixel count.
@@ -146,19 +194,23 @@ The detector sees 640×640 either way, and NVDEC and network costs grow with the
 - **Heartbeat:** a running job touches its stream entry every 20 s.
 - **Crashed workers:** a worker that dies leaves the entry pending, and another worker reclaims it with `XAUTOCLAIM` after 120 s.
 - **Retries:** after 3 attempts the job is marked failed and copied to `jobs:video:dead`.
+- **Models:** detection, pose and segmentation models. Pose results carry keypoints and segmentation results carry polygons; the annotated video draws skeletons and mask outlines.
 - **Results:** `detections.jsonl` (one line per sampled frame, with track ids), a summary (counts per class, unique tracks), and an annotated H.264 MP4 when `annotate=true`.
 - **Links:** the result links are presigned, and returned as `/storage/...` paths that nginx serves.
 
 ## Model lifecycle
 
 1. **Source:** the `.pt` weights in `inference/weights/` are the source of truth.
-2. **Export:** `export_onnx.py` inspects each model (task, head, classes, tensor I/O → `build/<name>/meta.json`) and exports it to ONNX.
-3. **uint8 input:** `wrap_uint8.py` adds the UINT8 NHWC input.
-4. **Engine:** `build_plan.sh <version>` runs `trtexec` from the **same Triton image** that serves the engines, because TensorRT plans only load on the TensorRT version and GPU that built them. Output is FP16 with a batch profile of 1 / opt / max.
+2. **Export:** `export_onnx.py` inspects each model (task, head, classes, tensor I/O → `build/<name>/meta.json`) and exports it to ONNX. Output shapes come from an ONNX Runtime dry run, since some exported dims are symbolic. Non-YOLO sequence networks are defined in `export/sequence_models.py` and chosen by `builder` in `models.yaml`.
+3. **uint8 input:** `wrap_uint8.py` adds the UINT8 NHWC input (sequence models are copied unchanged).
+4. **Engine:** `build_plan.sh <version>` runs `trtexec` from the **same Triton image** that serves the engines, because TensorRT plans only load on the TensorRT version and GPU that built them. Output is FP16 (FP32 where `models.yaml` says `precision: fp32`) with a batch profile of 1 / opt / max.
 5. **Triton config:** `gen_config.py` writes `config.pbtxt` from the real tensor I/O, with dynamic batching, a bounded queue that rejects on timeout, one GPU instance, and warm-up.
 6. **Parity:** `validation/parity.py --write-golden` compares the engine with the `.pt` on frames sampled from the clips:
    - detectors: recall and precision of confident boxes ≥ 0.95, mean IoU ≥ 0.90, mean confidence difference ≤ 0.05;
-   - classifiers: top-1 agreement ≥ 0.95.
+   - pose: as detectors, plus the mean distance of matched keypoints (reference conf ≥ 0.5) ≤ 3 px at 640;
+   - segmentation: as detectors, plus the mean mask IoU of matched boxes ≥ 0.85 (masks at input size, sampled every 4 px);
+   - classifiers: top-1 agreement ≥ 0.95;
+   - sequence: top-1 agreement ≥ 0.95 and mean probability difference ≤ 0.02. The windows are built from the clips with yolo26m-pose + ByteTrack at 3 fps, plus shuffled and random windows, since the clips show no shoplifting.
 
    It then saves `golden.npz` (the inputs plus the `.pt` outputs), so the API can re-run the same gate without torch.
 7. **Rollout:** `POST /v1/models/{name}/versions/{v}` uploads the version, then `.../deploy`:
@@ -170,7 +222,7 @@ The detector sees 640×640 either way, and NVDEC and network costs grow with the
    - `rollback` re-activates the previous version through the same gate.
 8. **Watchdog:** a model that is serving is **never reloaded in place**. With Triton 25.10, reloading a detector (embedded NMS) while one of its versions was kept made the next request to that version segfault the server (reproduced, see the commit). The API's watchdog reloads active models after a Triton restart (explicit mode comes back empty) and unloads strays.
 
-Parity on 2026-11-04 (FP16 engines vs FP32 `.pt`):
+Parity on 2026-11-04 (FP16 engines vs FP32 `.pt`; precision before duplicate suppression):
 
 | Model | Recall | Precision | Mean IoU | Mean conf diff |
 |---|---|---|---|---|
@@ -179,6 +231,20 @@ Parity on 2026-11-04 (FP16 engines vs FP32 `.pt`):
 | fire_detection | 1.000 | 1.000 | 0.992 | 0.003 |
 | ppe_detection | 1.000 | 1.000 | 0.994 | 0.001 |
 | yolo26n_cls | top-1 agreement 1.000 | | | 0.005 |
+
+Parity on 2026-11-06 for the InsightEye models (120 frames, or 48 pose windows for the sequence model):
+
+| Model | Recall | Precision | Mean IoU | Mean conf diff | Task metric |
+|---|---|---|---|---|---|
+| gender_detection | 1.000 | 1.000 | 0.992 | 0.002 | |
+| gender0_detection | 1.000 | 1.000 | 0.992 | 0.001 | |
+| yolo26l_detection | 1.000 | 0.972 | 0.994 | 0.002 | |
+| yolo26m_pose | 1.000 | 1.000 | 0.994 | 0.002 | keypoint error 0.12 px |
+| yolo26n_seg | 1.000 | 0.955 | 0.993 | 0.002 | mask IoU 0.995 |
+| yolo11n_seg | 1.000 | 0.963 | 0.993 | 0.002 | mask IoU 0.996 |
+| shoplifting_seq (FP32) | top-1 agreement 1.000 | | | < 0.0001 | 29 Normal / 19 Shoplifting windows |
+
+With duplicate suppression, yolo26n_seg and yolo26n_detection both reach precision 1.000 on their golden files.
 
 INT8 is deliberately not enabled. It needs representative calibration data, and its accuracy has to be compared against FP16 before it is used.
 

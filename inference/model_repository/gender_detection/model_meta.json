@@ -1,0 +1,36 @@
+{
+  "name": "gender_detection",
+  "task": "detect",
+  "imgsz": 640,
+  "max_batch": 16,
+  "num_classes": 3,
+  "names": {
+    "0": "female",
+    "1": "male",
+    "2": "child"
+  },
+  "weights": "gender.pt",
+  "architecture": "DetectionModel",
+  "embedded_nms": true,
+  "end2end": true,
+  "input": {
+    "name": "images",
+    "dtype": "UINT8",
+    "dims": [
+      640,
+      640,
+      3
+    ]
+  },
+  "precision": "fp16",
+  "framework": "ultralytics",
+  "outputs": [
+    {
+      "name": "output0",
+      "shape": [
+        300,
+        6
+      ]
+    }
+  ]
+}

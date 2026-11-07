@@ -1,0 +1,34 @@
+{
+  "name": "shoplifting_seq",
+  "task": "sequence",
+  "imgsz": 0,
+  "max_batch": 32,
+  "num_classes": 2,
+  "names": {
+    "0": "Normal",
+    "1": "Shoplifting"
+  },
+  "weights": "shoplifting.pt",
+  "architecture": "ShopliftingClassifier",
+  "embedded_nms": false,
+  "end2end": false,
+  "input": {
+    "name": "sequences",
+    "dtype": "FLOAT",
+    "dims": [
+      120,
+      17,
+      12
+    ]
+  },
+  "precision": "fp32",
+  "framework": "pytorch",
+  "outputs": [
+    {
+      "name": "probs",
+      "shape": [
+        2
+      ]
+    }
+  ]
+}

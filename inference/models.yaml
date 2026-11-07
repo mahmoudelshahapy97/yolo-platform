@@ -4,7 +4,12 @@
 # export_onnx.py -> wrap_uint8.py -> build_plan.sh, which produces
 # model_repository/<name>/<version>/model.plan plus config.pbtxt.
 #
+# Tasks: detect, pose, segment (NMS embedded, [N, 300, 6 + extras]), classify, and
+# sequence (a non-YOLO network from export/sequence_models.py, picked by ``builder``,
+# that takes FP32 feature windows instead of images).
+#
 # class_names (optional) overrides the names stored in the weights.
+# precision (optional, default fp16) is the TensorRT build precision.
 # instances (optional, default 1) is the number of engine copies Triton runs.
 #
 # max_batch is the largest batch the TensorRT profile accepts. Triton's
@@ -46,3 +51,53 @@ models:
     imgsz: 224
     max_batch: 32
     opt_batch: 16
+  # ---- From InsightEye (/home/ubuntu/insighteye/models), added 2026-11-06 ----
+  - name: gender_detection
+    weights: gender.pt
+    task: detect
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+  - name: gender0_detection
+    weights: gender0.pt
+    task: detect
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+    # The older 2-class gender model carries no names; InsightEye counts 0 as female, 1 as male.
+    class_names: {0: female, 1: male}
+  - name: yolo26l_detection
+    weights: yolo26l.pt
+    task: detect
+    imgsz: 640
+    max_batch: 8
+    opt_batch: 4
+  - name: yolo26m_pose
+    weights: yolo26m-pose.pt
+    task: pose
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+  - name: yolo26n_seg
+    weights: yolo26n-seg.pt
+    task: segment
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+  - name: yolo11n_seg
+    weights: yolo11n-seg.pt
+    task: segment
+    imgsz: 640
+    max_batch: 16
+    opt_batch: 8
+  # InsightEye's shoplifting classifier: one person's pose over 120 samples
+  # (17 COCO keypoints x 12 features, shared/yolo_platform_shared/behavior.py).
+  # FP32: a recurrent net judged against a low threshold; it is tiny anyway.
+  - name: shoplifting_seq
+    weights: shoplifting.pt
+    task: sequence
+    builder: shoplifting
+    imgsz: 0
+    precision: fp32
+    max_batch: 32
+    opt_batch: 8

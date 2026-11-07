@@ -86,8 +86,26 @@ async def _check_models(core, p: Principal, model: str, config) -> None:
         if await core.registry.active(m) is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"model '{m}' is not serving")
     primary = await core.registry.active(model)
-    if primary.task != "detect":
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"camera model must be a detector, '{model}' is not")
+    # Segmentation is not offered on cameras: its mask prototypes (3.3 MB per frame) would
+    # cost more than the detection itself at camera rates. Use video jobs for masks.
+    if primary.task not in ("detect", "pose"):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"camera model must be a detection or pose model, '{model}' is {primary.task}")
+    if primary.imgsz != 640:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"camera model must take 640 px input, '{model}' takes {primary.imgsz}")
+    if config.shoplifting is not None:
+        if primary.task != "pose":
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"shoplifting needs a pose camera model (e.g. yolo26m_pose), '{model}' is {primary.task}")
+        seq = await core.registry.active(config.shoplifting.model)
+        if seq.task != "sequence":
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"shoplifting.model must be a sequence model, '{config.shoplifting.model}' is {seq.task}")
+    for t in config.triggered:
+        trig = await core.registry.active(t.model)
+        if trig.task not in ("detect", "pose"):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"triggered model '{t.model}' must be a detection or pose model, it is {trig.task}")
 
 
 @router.get("", response_model=list[CameraOut])

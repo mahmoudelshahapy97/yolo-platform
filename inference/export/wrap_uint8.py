@@ -9,9 +9,15 @@ rest on the GPU:
     images: UINT8 [N, H, W, 3]  ->  Cast(FP32) -> Div 255 -> Transpose(0,3,1,2) -> original graph
 
     python export/wrap_uint8.py build/<name>/model.fp32.onnx build/<name>/model.onnx
+
+Models that do not take images (meta.json next to the source says the input is
+not UINT8, e.g. ``sequence``) are copied unchanged.
 """
 
+import json
+import shutil
 import sys
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -21,6 +27,10 @@ INPUT_NAME = "images"
 
 
 def wrap(src: str, dst: str) -> None:
+    meta_path = Path(src).with_name("meta.json")
+    if meta_path.is_file() and json.loads(meta_path.read_text()).get("input", {}).get("dtype", "UINT8") != "UINT8":
+        shutil.copyfile(src, dst)
+        return
     model = onnx.load(src)
     graph = model.graph
     if len(graph.input) != 1:

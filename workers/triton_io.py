@@ -13,7 +13,7 @@ import os
 import threading
 import time
 import uuid
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import tritonclient.grpc as grpcclient
@@ -27,7 +27,7 @@ ACTIVE_KEY = "models:active"
 
 class ShmSlot:
     def __init__(self, client: grpcclient.InferenceServerClient, max_batch: int, size: int,
-                 out_shape=(300, 6), out_dtype=np.float32) -> None:
+                 out_shape=(300, 57), out_dtype=np.float32) -> None:
         self.client = client
         self.max_batch = max_batch
         self.size = size
@@ -45,13 +45,23 @@ class ShmSlot:
         self.inputs = shm.get_contents_as_numpy(self._in, np.uint8, [max_batch, size, size, 3])
         self.outputs = shm.get_contents_as_numpy(self._out, self.out_dtype, [max_batch, *out_shape])
 
-    def infer(self, model: str, version: int, n: int, timeout_s: float = 5.0) -> np.ndarray:
+    def infer(self, model: str, version: int, n: int, timeout_s: float = 5.0, out_cols: Optional[int] = None) -> np.ndarray:
+        """Run ``n`` frames of the input region; ``out_cols`` is the model's row width (6 detect, 57 pose).
+
+        The output region is sized for the widest model; a narrower model's rows are
+        packed at the start of it, so the returned view is reshaped to [n, 300, out_cols].
+        """
+        rows, cols = self.out_shape[0], out_cols or self.out_shape[1]
+        if cols > self.out_shape[1]:
+            raise ValueError(f"model output width {cols} exceeds the slot's {self.out_shape[1]}")
+        nbytes = n * rows * cols * self.out_dtype.itemsize
         inp = grpcclient.InferInput("images", [n, self.size, self.size, 3], "UINT8")
         inp.set_shared_memory(self.in_name, n * self.size * self.size * 3)
         out = grpcclient.InferRequestedOutput("output0")
-        out.set_shared_memory(self.out_name, n * int(np.prod(self.out_shape)) * self.out_dtype.itemsize)
+        out.set_shared_memory(self.out_name, nbytes)
         self.client.infer(model, [inp], model_version=str(version), outputs=[out], client_timeout=timeout_s)
-        return self.outputs[:n]
+        flat = self.outputs.reshape(-1)[: n * rows * cols]
+        return flat.reshape(n, rows, cols)
 
     def close(self) -> None:
         for name, region in ((self.in_name, self._in), (self.out_name, self._out)):
@@ -66,12 +76,27 @@ class ShmSlot:
 
 
 def infer_plain(client: grpcclient.InferenceServerClient, model: str, version: int, batch: np.ndarray,
-                timeout_s: float = 5.0) -> np.ndarray:
-    inp = grpcclient.InferInput("images", list(batch.shape), "UINT8")
+                timeout_s: float = 5.0, input_name: str = "images", output: str = "output0") -> np.ndarray:
+    return infer_outputs(client, model, version, batch, [output], timeout_s, input_name)[0]
+
+
+def infer_outputs(client: grpcclient.InferenceServerClient, model: str, version: int, batch: np.ndarray,
+                  outputs: List[str], timeout_s: float = 5.0, input_name: str = "images") -> List[np.ndarray]:
+    """Several outputs in one request (segmentation: detections + mask prototypes), in ``outputs`` order."""
+    inp = grpcclient.InferInput(input_name, list(batch.shape), "UINT8" if batch.dtype == np.uint8 else "FP32")
     inp.set_data_from_numpy(np.ascontiguousarray(batch))
-    res = client.infer(model, [inp], model_version=str(version), outputs=[grpcclient.InferRequestedOutput("output0")],
-                       client_timeout=timeout_s)
-    return res.as_numpy("output0")
+    res = client.infer(model, [inp], model_version=str(version),
+                       outputs=[grpcclient.InferRequestedOutput(o) for o in outputs], client_timeout=timeout_s)
+    return [res.as_numpy(o) for o in outputs]
+
+
+def model_outputs(model: dict) -> List[str]:
+    """Output names of an active model (entries published before 2026-11-06 have none: detection)."""
+    return list(model.get("outputs") or ["output0"])
+
+
+def model_input_name(model: dict) -> str:
+    return (model.get("input") or {}).get("name", "images")
 
 
 class ActiveModels:

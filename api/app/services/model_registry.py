@@ -32,7 +32,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
 import numpy as np
@@ -40,7 +40,7 @@ from google.protobuf import text_format
 from redis.asyncio import Redis
 from tritonclient.grpc import model_config_pb2
 
-from yolo_platform_shared.gate import evaluate_classify, evaluate_detect
+from yolo_platform_shared.gate import evaluate
 
 from .triton_client import TritonClient
 
@@ -55,6 +55,9 @@ def serve_name(name: str, version: int) -> str:
     return f"{name}__v{version}"
 
 
+IMAGE_INPUT = {"name": "images", "dtype": "UINT8"}
+
+
 @dataclass
 class ActiveModel:
     name: str
@@ -63,10 +66,28 @@ class ActiveModel:
     imgsz: int
     max_batch: int
     names: Dict[int, str]
+    # From model_meta.json: the engine's input and outputs (config order), pose keypoint layout.
+    input: Optional[dict] = None
+    outputs: Tuple[str, ...] = ("output0",)
+    kpt_shape: Optional[Tuple[int, int]] = None
 
     @property
     def serve_name(self) -> str:
         return serve_name(self.name, self.version)
+
+    @property
+    def input_name(self) -> str:
+        return (self.input or IMAGE_INPUT)["name"]
+
+
+def io_fields(meta: Optional[dict]) -> dict:
+    """The I/O description workers and adapters need, from a version's model_meta.json."""
+    meta = meta or {}
+    return {
+        "input": meta.get("input") or {**IMAGE_INPUT, "dims": [meta.get("imgsz", 0), meta.get("imgsz", 0), 3]},
+        "outputs": [o["name"] for o in meta.get("outputs", [{"name": "output0"}])],
+        "kpt_shape": meta.get("kpt_shape"),
+    }
 
 
 class GateFailed(Exception):
@@ -130,10 +151,12 @@ class ModelRegistry:
                 sha_file = self.repository / name / str(v) / "model.plan.sha256"
                 sha = sha_file.read_text().strip() if sha_file.is_file() else None
                 status = await self.pool.fetchval(
-                    """INSERT INTO model_version (model_name, version, task, imgsz, max_batch, names, sha256)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """INSERT INTO model_version (model_name, version, task, imgsz, max_batch, names, sha256,
+                                                  framework, precision)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                        ON CONFLICT (model_name, version) DO NOTHING RETURNING status""",
                     name, v, meta["task"], meta["imgsz"], meta["max_batch"], json.dumps(meta["names"]), sha,
+                    meta.get("framework", "ultralytics"), meta.get("precision", "fp16"),
                 )
                 added += status is not None
         return added
@@ -163,11 +186,14 @@ class ModelRegistry:
         rows = await self.pool.fetch(
             "SELECT model_name, version, task, imgsz, max_batch, names FROM model_version WHERE status = 'active'"
         )
-        self._cache = {
-            r["model_name"]: ActiveModel(r["model_name"], r["version"], r["task"], r["imgsz"], r["max_batch"],
-                                         {int(k): v for k, v in json.loads(r["names"]).items()})
-            for r in rows
-        }
+        cache = {}
+        for r in rows:
+            io = io_fields(self._meta(r["model_name"], r["version"]))
+            cache[r["model_name"]] = ActiveModel(
+                r["model_name"], r["version"], r["task"], r["imgsz"], r["max_batch"],
+                {int(k): v for k, v in json.loads(r["names"]).items()}, input=io["input"],
+                outputs=tuple(io["outputs"]), kpt_shape=tuple(io["kpt_shape"]) if io["kpt_shape"] else None)
+        self._cache = cache
         self._cache_at = time.monotonic()
 
     # ---------- serving repository ----------
@@ -238,12 +264,14 @@ class ModelRegistry:
                 return {"passed": False, "error": "model.plan sha256 does not match model.plan.sha256"}
         golden = dict(np.load(golden_path))
         inputs = golden["inputs"]
-        outs = []
+        io = io_fields(meta)
+        chunks: List[List[np.ndarray]] = []
         for start in range(0, len(inputs), meta["max_batch"]):
-            outs.append(await self.triton.infer(serve_name(name, version), 1, inputs[start:start + meta["max_batch"]]))
-        outputs = np.concatenate(outs)
-        evaluate = evaluate_classify if meta["task"] == "classify" else evaluate_detect
-        return await asyncio.to_thread(evaluate, golden, outputs)
+            chunks.append(await self.triton.infer_many(serve_name(name, version), 1,
+                                                       inputs[start:start + meta["max_batch"]], io["outputs"],
+                                                       io["input"]["name"]))
+        outputs = [np.concatenate([c[i] for c in chunks]) for i in range(len(io["outputs"]))]
+        return await asyncio.to_thread(evaluate, meta["task"], golden, outputs, meta)
 
     async def activate(self, name: str, version: int, reason: str = "rollout") -> dict:
         lock = self.redis.lock(f"lock:model:{name}", timeout=600, blocking_timeout=600)
@@ -304,7 +332,8 @@ class ModelRegistry:
             "SELECT model_name, version, task, imgsz, max_batch, names FROM model_version WHERE status = 'active'")
         mapping = {r["model_name"]: json.dumps({"version": r["version"], "serve_name": serve_name(r["model_name"], r["version"]),
                                                  "task": r["task"], "imgsz": r["imgsz"], "max_batch": r["max_batch"],
-                                                 "names": json.loads(r["names"])})
+                                                 "names": json.loads(r["names"]),
+                                                 **io_fields(self._meta(r["model_name"], r["version"]))})
                    for r in rows}
         pipe = self.redis.pipeline()
         pipe.delete(ACTIVE_KEY)

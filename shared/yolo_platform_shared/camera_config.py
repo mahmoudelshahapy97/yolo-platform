@@ -14,6 +14,10 @@ on every frame:
   every_s     run periodically on the latest frame (e.g. fire detection once a second)
   on_rule     run when the named rule fires (e.g. PPE check when a person enters a zone)
 A rule's ``classify`` runs a classifier on the crop of the object that fired it.
+
+``shoplifting`` (pose camera models only) keeps a window of every tracked
+person's pose and judges it with a sequence model (``shoplifting_seq``); see
+behavior.py. Alerts are events of type ``shoplifting``.
 """
 
 from typing import List, Literal, Optional, Tuple
@@ -88,9 +92,27 @@ class TriggeredModel(BaseModel):
         return self
 
 
+class Shoplifting(BaseModel):
+    """Per-person shoplifting detection; defaults are the standalone shoplifting app's."""
+    model: str = "shoplifting_seq"
+    # Samples per second fed into a person's window (120 samples: 40 s at 3 fps, as trained).
+    sample_fps: float = Field(3.0, ge=0.5, le=10)
+    # Smoothed Shoplifting probability that raises an alert.
+    threshold: float = Field(0.5, ge=0.0, le=1.0)
+    smooth_window: int = Field(3, ge=1, le=30)
+    # Real samples a window needs before it is judged.
+    min_window_samples: int = Field(30, ge=1, le=120)
+    # People shorter than this (box height, pixels) are too small to read a pose from.
+    min_person_height_px: float = Field(60.0, ge=0, le=4000)
+    min_confidence: float = Field(0.4, ge=0.0, le=1.0)
+    track_cooldown_s: float = Field(300.0, ge=0, le=86400)
+    camera_cooldown_s: float = Field(30.0, ge=0, le=86400)
+
+
 class CameraConfig(BaseModel):
     rules: List[Rule] = Field(default_factory=list)
     triggered: List[TriggeredModel] = Field(default_factory=list)
+    shoplifting: Optional[Shoplifting] = None
     # Detections below this never reach the tracker.
     detect_confidence: float = Field(0.25, ge=0.05, le=1.0)
     # Restrict the primary detector to these class names (None = all).
@@ -109,4 +131,6 @@ class CameraConfig(BaseModel):
     def models_used(self) -> List[str]:
         used = [t.model for t in self.triggered]
         used += [r.classify.model for r in self.rules if r.classify]
+        if self.shoplifting is not None:
+            used.append(self.shoplifting.model)
         return sorted(set(used))

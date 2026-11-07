@@ -10,7 +10,7 @@ from redis.asyncio import Redis
 from . import metrics
 from .config import get_settings
 from .deps import AppState
-from .routes import admin, cameras, health, images, jobs, models
+from .routes import admin, cameras, health, images, jobs, models, sequences
 from .services.auth import KeyStore
 from .services.inference_service import InferenceService
 from .services.model_registry import ModelRegistry
@@ -72,5 +72,6 @@ async def timing(request: Request, call_next):
     return response
 
 
-for r in (health.router, models.router, images.router, jobs.router, cameras.router, admin.router):
+for r in (health.router, models.router, images.router, sequences.router, jobs.router, cameras.router,
+          admin.router):
     app.include_router(r)

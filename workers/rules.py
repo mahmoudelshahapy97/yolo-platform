@@ -19,6 +19,7 @@ class TrackedObject:
     class_name: str
     confidence: float
     box: Tuple[float, float, float, float]   # xyxy, pixels
+    keypoints: Optional[np.ndarray] = None   # pose models: [K, 3] (x, y, conf), pixels
 
 
 @dataclass

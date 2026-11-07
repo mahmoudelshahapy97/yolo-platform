@@ -39,8 +39,8 @@ instance_group [
   }
 ]
 
-# Serve only the version the registry activates (explicit model control loads
-# versions deliberately; see api/app/services/model_registry.py).
+# The registry serves each version as its own Triton model (<name>__v<version>),
+# generated from this file; see api/app/services/model_registry.py.
 version_policy: { latest: { num_versions: 1 } }
 
 model_warmup [

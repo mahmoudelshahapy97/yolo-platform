@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,10 @@ class DetectionOut(BaseModel):
     class_name: str
     confidence: float
     bbox: BBox
+    # pose models: [x, y, confidence] per keypoint (COCO order for the 17-point models), image pixels
+    keypoints: Optional[List[List[float]]] = None
+    # segmentation models: outline of the instance mask, [x, y] image pixels
+    polygon: Optional[List[List[float]]] = None
     classification: Optional[List[ClassScore]] = None
 
 
@@ -52,6 +56,33 @@ class InferResponse(BaseModel):
     classify_model_version: Optional[str] = None
     timing: TimingOut
     images: List[ImageOut]
+
+
+class SequenceIn(BaseModel):
+    model: str = "shoplifting_seq"
+    keypoints: Optional[List[List[Any]]] = Field(
+        None, description="per window, up to 120 samples (oldest first) of one person's 17 keypoints [x, y] "
+                          "normalised to the frame (0..1); null for a sample where the person was not seen. "
+                          "Windows shorter than 120 are left-padded, as cameras do.")
+    features: Optional[List[Any]] = Field(
+        None, description="per window, ready-made features [120][17][12] (shared/yolo_platform_shared/behavior.py)")
+
+
+class SequenceResult(BaseModel):
+    index: int
+    class_id: int
+    class_name: str
+    confidence: float
+    probabilities: Dict[str, float]
+
+
+class SequenceResponse(BaseModel):
+    request_id: str
+    model: str
+    model_version: str
+    task: str
+    timing: TimingOut
+    results: List[SequenceResult]
 
 
 class CameraIn(BaseModel):

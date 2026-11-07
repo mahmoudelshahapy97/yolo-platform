@@ -1,7 +1,11 @@
-"""Model adapters and the image inference pipeline.
+"""Model adapters and the inference pipelines.
 
-Routes hand decoded BGR images to ``InferenceService``; adapters own every
-model-specific step (preprocess, decode, coordinates). Routes never see tensors.
+Routes hand decoded BGR images (or pose feature windows) to ``InferenceService``;
+adapters own every model-specific step (preprocess, decode, coordinates). Routes
+never see tensors.
+
+Box tasks (detect, pose, segment) share one adapter: the engine output is
+[N, 300, 6 + extras] and the task picks the decoder (keypoints, masks).
 """
 
 import asyncio
@@ -11,11 +15,14 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-from yolo_platform_shared.decode import decode_classification, decode_detections
+from yolo_platform_shared.decode import decode_classification, decode_detections, decode_pose, decode_segment
 from yolo_platform_shared.preprocess import classify_crop, letterbox
 
 from .model_registry import ActiveModel, ModelRegistry
 from .triton_client import TritonClient
+
+
+BOX_TASKS = ("detect", "pose", "segment")
 
 
 class ModelNotServing(LookupError):
@@ -51,6 +58,8 @@ def _ms(start: float) -> float:
 
 
 class DetectionAdapter:
+    """detect, pose and segment models (end-to-end box output, plus keypoints or mask prototypes)."""
+
     def __init__(self, model: ActiveModel) -> None:
         self.model = model
 
@@ -59,9 +68,16 @@ class DetectionAdapter:
         metas = [letterbox(img, self.model.imgsz, out=batch[i])[1] for i, img in enumerate(images)]
         return batch, metas
 
-    def decode(self, outputs: np.ndarray, metas, conf: float, classes: Optional[Sequence[int]], max_det: int):
-        return [decode_detections(out, m, self.model.names, conf=conf, classes=classes, max_det=max_det)
-                for out, m in zip(outputs, metas)]
+    def decode(self, outputs: List[np.ndarray], metas, conf: float, classes: Optional[Sequence[int]], max_det: int):
+        m = self.model
+        if m.task == "pose":
+            return [decode_pose(out, meta, m.names, m.kpt_shape or (17, 3), conf=conf, classes=classes, max_det=max_det)
+                    for out, meta in zip(outputs[0], metas)]
+        if m.task == "segment":
+            return [decode_segment(out, protos, meta, m.names, m.imgsz, conf=conf, classes=classes, max_det=max_det)
+                    for out, protos, meta in zip(outputs[0], outputs[1], metas)]
+        return [decode_detections(out, meta, m.names, conf=conf, classes=classes, max_det=max_det)
+                for out, meta in zip(outputs[0], metas)]
 
 
 class ClassificationAdapter:
@@ -83,35 +99,42 @@ class InferenceService:
         self.triton = triton
         self.registry = registry
 
-    async def _model(self, name: str, task: Optional[str] = None) -> ActiveModel:
+    async def _model(self, name: str, task=None) -> ActiveModel:
         model = await self.registry.active(name)
         if model is None:
             raise ModelNotServing(f"model '{name}' has no active version")
-        if task and model.task != task:
-            raise ModelNotServing(f"model '{name}' is a {model.task} model, not {task}")
+        tasks = (task,) if isinstance(task, str) else task
+        if tasks and model.task not in tasks:
+            raise ModelNotServing(f"model '{name}' is a {model.task} model, not {' or '.join(tasks)}")
         return model
 
     async def _run(self, model: ActiveModel, batch: np.ndarray) -> np.ndarray:
-        """Split into engine-sized chunks; Triton batches concurrent chunks itself."""
+        """The first output; split into engine-sized chunks (Triton batches concurrent chunks itself)."""
+        return (await self._run_all(model, batch))[0]
+
+    async def _run_all(self, model: ActiveModel, batch: np.ndarray) -> List[np.ndarray]:
+        """Every output of the model, in config order."""
         chunks = [batch[i:i + model.max_batch] for i in range(0, len(batch), model.max_batch)]
-        outs = await asyncio.gather(*(self.triton.infer(model.serve_name, 1, c) for c in chunks))
-        return np.concatenate(outs)
+        outs = await asyncio.gather(*(self.triton.infer_many(model.serve_name, 1, c, list(model.outputs),
+                                                             model.input_name) for c in chunks))
+        return [np.concatenate([o[i] for o in outs]) for i in range(len(model.outputs))]
 
     async def detect(self, images: List[np.ndarray], model_name: str, conf: float = 0.25,
                      classes: Optional[Sequence[int]] = None, max_det: int = 300,
                      classify_model: Optional[str] = None, classify_classes: Optional[Sequence[int]] = None,
                      top_k: int = 1) -> tuple[ActiveModel, Optional[ActiveModel], List[ImageResult], Timings]:
-        model = await self._model(model_name, "detect")
+        model = await self._model(model_name, BOX_TASKS)
         adapter = DetectionAdapter(model)
         t = Timings()
         s = time.perf_counter()
         batch, metas = await asyncio.to_thread(adapter.preprocess, images)
         t.preprocess_ms += _ms(s)
         s = time.perf_counter()
-        outputs = await self._run(model, batch)
+        outputs = await self._run_all(model, batch)
         t.inference_ms += _ms(s)
         s = time.perf_counter()
-        per_image = adapter.decode(outputs, metas, conf, classes, max_det)
+        # Mask contours cost a few ms per image: off the event loop.
+        per_image = await asyncio.to_thread(adapter.decode, outputs, metas, conf, classes, max_det)
         t.postprocess_ms += _ms(s)
 
         results = [ImageResult(width=m.orig_w, height=m.orig_h, detections=[d.to_dict() for d in dets])
@@ -159,3 +182,15 @@ class InferenceService:
                    for img, top in zip(images, adapter.decode(outputs, top_k))]
         t.postprocess_ms += _ms(s)
         return model, results, t
+
+    async def sequences(self, windows: np.ndarray, model_name: str):
+        """Feature windows [N, T, V, C] float32 -> per-window class probabilities [N, classes]."""
+        model = await self._model(model_name, "sequence")
+        dims = list((model.input or {}).get("dims") or [])
+        if dims and list(windows.shape[1:]) != dims:
+            raise ValueError(f"model '{model_name}' takes windows of shape {dims}, got {list(windows.shape[1:])}")
+        t = Timings()
+        s = time.perf_counter()
+        probs = await self._run(model, np.ascontiguousarray(windows, dtype=np.float32))
+        t.inference_ms += _ms(s)
+        return model, probs, t

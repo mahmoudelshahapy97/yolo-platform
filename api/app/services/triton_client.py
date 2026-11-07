@@ -1,7 +1,7 @@
 """Async gRPC client for Triton, shared by every request in an API process."""
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import tritonclient.grpc.aio as grpcclient
@@ -60,13 +60,20 @@ class TritonClient:
     async def unload(self, name: str) -> None:
         await self.client.unload_model(name)
 
-    async def infer(self, model: str, version: int, batch: np.ndarray, output: str = "output0") -> np.ndarray:
-        inp = grpcclient.InferInput("images", list(batch.shape), "UINT8")
+    async def infer(self, model: str, version: int, batch: np.ndarray, output: str = "output0",
+                    input_name: str = "images") -> np.ndarray:
+        """One output of ``model`` on ``batch``."""
+        return (await self.infer_many(model, version, batch, [output], input_name))[0]
+
+    async def infer_many(self, model: str, version: int, batch: np.ndarray, outputs: List[str],
+                         input_name: str = "images") -> List[np.ndarray]:
+        """Several outputs (e.g. segmentation: detections + mask prototypes) in one request, in ``outputs`` order."""
+        inp = grpcclient.InferInput(input_name, list(batch.shape), "UINT8" if batch.dtype == np.uint8 else "FP32")
         inp.set_data_from_numpy(np.ascontiguousarray(batch))
         try:
             res = await self.client.infer(
                 model, [inp], model_version=str(version),
-                outputs=[grpcclient.InferRequestedOutput(output)],
+                outputs=[grpcclient.InferRequestedOutput(o) for o in outputs],
                 client_timeout=self.timeout_s,
             )
         except InferenceServerException as exc:
@@ -76,7 +83,7 @@ class TritonClient:
             ):
                 raise TritonUnavailable(msg) from exc
             raise
-        return res.as_numpy(output)
+        return [res.as_numpy(o) for o in outputs]
 
     async def statistics(self, name: str = "") -> Dict:
         return await self.client.get_inference_statistics(name, as_json=True)

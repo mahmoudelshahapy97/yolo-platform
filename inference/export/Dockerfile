@@ -12,5 +12,8 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
         ultralytics==8.4.178 onnx==1.19.0 onnxslim==0.1.71 onnxruntime==1.23.2 \
         pyyaml==6.0.3 numpy==2.2.6 tritonclient[grpc]==2.61.0
 
+# ByteTrack's assignment solver: parity.py builds pose windows with Ultralytics' tracker.
+RUN pip install --no-cache-dir lap==0.5.12
+
 WORKDIR /work
 ENV YOLO_CONFIG_DIR=/tmp/ultralytics PYTHONDONTWRITEBYTECODE=1

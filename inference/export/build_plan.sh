@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build FP16 TensorRT engines from build/<name>/model.onnx with trtexec from the
+# Build TensorRT engines (FP16 unless meta.json says precision: fp32) from build/<name>/model.onnx with trtexec from the
 # SAME Triton image that serves them (TensorRT plans only load on the TensorRT
 # version and GPU architecture that built them).
 #
@@ -19,20 +19,23 @@ fi
 
 for name in "${MODELS[@]}"; do
   meta="$ROOT/build/$name/meta.json"
-  imgsz=$(python3 -c "import json;print(json.load(open('$meta'))['imgsz'])")
-  maxb=$(python3 -c "import json;print(json.load(open('$meta'))['max_batch'])")
-  optb=$(python3 -c "import json;print(json.load(open('$meta'))['opt_batch'])")
+  # Input name and per-item dims (images: SxSx3 UINT8; sequences: TxVxC FP32), batch range, precision.
+  read -r inp dims maxb optb prec < <(python3 -c "
+import json; m = json.load(open('$meta'))
+i = m.get('input') or {'name': 'images', 'dims': [m['imgsz'], m['imgsz'], 3]}
+print(i['name'], 'x'.join(map(str, i['dims'])), m['max_batch'], m['opt_batch'], m.get('precision', 'fp16'))")
+  flags=(); [ "$prec" = fp16 ] && flags+=(--fp16)
   out="$ROOT/model_repository/$name/$VERSION"
   mkdir -p "$out"
-  echo "== $name v$VERSION: ${imgsz}px, batch 1/$optb/$maxb, FP16"
+  echo "== $name v$VERSION: $inp ${dims}, batch 1/$optb/$maxb, ${prec^^}"
   docker run --rm --gpus all -u "$(id -u):$(id -g)" -v "$ROOT:/work" -w /work "$TRITON_IMAGE" \
     /usr/src/tensorrt/bin/trtexec \
       --onnx="build/$name/model.onnx" \
       --saveEngine="model_repository/$name/$VERSION/model.plan" \
-      --fp16 \
-      --minShapes="images:1x${imgsz}x${imgsz}x3" \
-      --optShapes="images:${optb}x${imgsz}x${imgsz}x3" \
-      --maxShapes="images:${maxb}x${imgsz}x${imgsz}x3" \
+      "${flags[@]}" \
+      --minShapes="$inp:1x$dims" \
+      --optShapes="$inp:${optb}x$dims" \
+      --maxShapes="$inp:${maxb}x$dims" \
       --memPoolSize=workspace:2048M \
       --skipInference \
       > "$ROOT/build/$name/trtexec-v$VERSION.log" 2>&1 \

@@ -1009,5 +1009,24 @@
   "weights": "yolo26n-cls.pt",
   "architecture": "ClassificationModel",
   "embedded_nms": false,
-  "end2end": false
+  "end2end": false,
+  "input": {
+    "name": "images",
+    "dtype": "UINT8",
+    "dims": [
+      224,
+      224,
+      3
+    ]
+  },
+  "precision": "fp16",
+  "framework": "ultralytics",
+  "outputs": [
+    {
+      "name": "output0",
+      "shape": [
+        1000
+      ]
+    }
+  ]
 }

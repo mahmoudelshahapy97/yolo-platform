@@ -1,4 +1,5 @@
-"""Synchronous image inference: one image or a batch, detection (+ crop classification) or classification."""
+"""Synchronous image inference: one image or a batch; detection, pose or segmentation (+ crop
+classification), or classification."""
 
 import asyncio
 import io
@@ -83,6 +84,9 @@ async def _run(request: Request, p: Principal, endpoint: str, files: List[Upload
         active = await core.registry.active(model)
         if active is None:
             raise ModelNotServing(f"model '{model}' has no active version")
+        if active.task == "sequence":
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"'{model}' classifies pose sequences, not images: use POST /v1/infer/sequences")
         if active.task == "classify":
             m, results, timing = await core.inference.classify(images, model, top_k=top_k)
             cm = None
