@@ -223,3 +223,19 @@ def test_duplicate_engine_boxes_are_suppressed_per_class():
     rows = select_rows(out, 0.25, None, 300)
     assert rows[:, 4].tolist() == pytest.approx([0.86, 0.80, 0.50])
     assert len(decode_detections(out, META, {}, conf=0.25)) == 3
+
+
+def test_decode_segment_masks_only_at_mask_conf():
+    protos = _rect_protos(40, 60, 80, 100)
+    out = np.zeros((300, 38), np.float32)
+    out[0, :6] = [100, 200, 400, 600, 0.9, 0]
+    out[1, :6] = [400, 400, 500, 500, 0.15, 0]        # tracking-only: kept, no mask
+    out[0, 6] = out[1, 6] = 1.0
+    dets = decode_segment(out, protos, META, {0: "thing"}, 640, conf=0.1, mask_conf=0.25)
+    assert [round(d.confidence, 2) for d in dets] == [0.9, 0.15]
+    assert dets[0].polygon is not None and len(dets[0].polygon) >= 4
+    assert dets[1].polygon is None
+    full = decode_segment(out, protos, META, {0: "thing"}, 640, conf=0.25)
+    np.testing.assert_allclose(dets[0].polygon, full[0].polygon)
+    only_low = decode_segment(out, protos, META, {0: "thing"}, 640, conf=0.1, mask_conf=0.95)
+    assert len(only_low) == 2 and all(d.polygon is None for d in only_low)

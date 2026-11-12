@@ -42,6 +42,10 @@ def _windows(body: SequenceIn) -> np.ndarray:
         if arr.shape[1:] != (NUM_FRAMES, NUM_KEYPOINTS, NUM_FEATURES):
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                                 f"features must be [N][{NUM_FRAMES}][{NUM_KEYPOINTS}][{NUM_FEATURES}], got {list(arr.shape)}")
+        # NaN/Infinity parse as JSON and values past float32 range become inf: the
+        # model would return NaN probabilities, which cannot be serialised.
+        if not np.isfinite(arr).all():
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "features must be finite float32 numbers")
         return arr
     out = []
     for n, seq in enumerate(body.keypoints):
@@ -78,7 +82,13 @@ async def infer_sequences(body: SequenceIn, request: Request, p: Principal = Dep
             metrics.REJECTED.labels("rate_limit").inc()
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded",
                                 headers={"Retry-After": str(max(1, int(retry + 0.999)))})
+    if core.inflight >= core.settings.max_inflight:
+        metrics.REJECTED.labels("inflight").inc()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "inference capacity exhausted, retry shortly",
+                            headers={"Retry-After": "1"})
     started = time.perf_counter()
+    core.inflight += 1
+    metrics.INFLIGHT.inc()
     try:
         model, probs, timing = await core.inference.sequences(windows, body.model)
     except ModelNotServing as exc:
@@ -88,8 +98,12 @@ async def infer_sequences(body: SequenceIn, request: Request, p: Principal = Dep
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
     except TritonUnavailable as exc:
         metrics.ERRORS.labels(body.model, "sequences", "triton_unavailable").inc()
+        metrics.REJECTED.labels("triton_queue").inc()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, f"inference server busy: {exc}",
                             headers={"Retry-After": "1"})
+    finally:
+        core.inflight -= 1
+        metrics.INFLIGHT.dec()
     total = time.perf_counter() - started
     metrics.REQUESTS.labels(body.model, "sequences", "ok").inc()
     metrics.LATENCY.labels(body.model, "sequences").observe(total)

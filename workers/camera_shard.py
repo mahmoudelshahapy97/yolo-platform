@@ -55,6 +55,7 @@ EVENT_STREAM = "events"
 EVENT_STREAM_MAXLEN = 500_000
 DETECT_SIZE = 640
 SLOT_BATCH = 16
+SLOT_COLS = 57               # output row width the shared-memory slot holds: 6 + 17 keypoints x 3
 PRIMARY_TASKS = ("detect", "pose")
 
 # ---------------- metrics ----------------
@@ -100,6 +101,12 @@ def out_cols(model: dict) -> int:
     return 6
 
 
+def servable_primary(model: Optional[dict]) -> bool:
+    """Whether a pipeline can run this model on the shared 640 frames and slot."""
+    return (model is not None and model["imgsz"] == DETECT_SIZE
+            and model.get("task", "detect") in PRIMARY_TASKS and out_cols(model) <= SLOT_COLS)
+
+
 def shoplifting_params(config: CameraConfig) -> Optional[ShopliftingParams]:
     c = config.shoplifting
     if c is None:
@@ -133,6 +140,7 @@ class CameraRuntime:
     last_events: int = 0
     seen: Dict[str, int] = field(default_factory=lambda: {"decoded": 0, "dropped": 0, "reconnects": 0})
     shoplifting: Optional[ShopliftingTracker] = None
+    stopped: bool = False        # set when the shard lets go of it: queued jobs must not emit for it
 
     @property
     def model(self) -> str:
@@ -172,6 +180,7 @@ class Shard:
         self.triggered: "queue.Queue[TriggeredJob]" = queue.Queue(maxsize=256)
         self.behavior: "queue.Queue[BehaviorJob]" = queue.Queue(maxsize=256)
         self._rr = 0
+        self._unservable_warned: Dict[str, float] = {}
 
     # ---------------- camera lifecycle ----------------
 
@@ -192,6 +201,9 @@ class Shard:
             rt = self.cameras.pop(cam_id, None)
         if rt is None:
             return
+        with rt.lock:
+            rt.stopped = True
+            rt.shoplifting = None
         rt.source.stop()
         self.redis.delete(f"camera:status:{cam_id}")
         # Drop the camera's series so label cardinality does not grow with camera churn.
@@ -259,14 +271,19 @@ class Shard:
         try:
             while not self.stop.is_set():
                 groups = self._fresh_by_model()
-                if not groups:
-                    time.sleep(0.003)
+                # Only groups whose model a pipeline can run: an unservable group must not
+                # win every round and starve the cameras on valid models.
+                servable = {}
+                for name, cams in groups.items():
+                    model = self.models.get(name)
+                    if servable_primary(model):
+                        servable[name] = (model, cams)
+                    else:
+                        self._warn_unservable(name, model)
+                if not servable:
+                    time.sleep(0.05 if groups else 0.003)
                     continue
-                model_name, cams = max(groups.items(), key=lambda kv: len(kv[1]))
-                model = self.models.get(model_name)
-                if model is None or model["imgsz"] != DETECT_SIZE or model.get("task", "detect") not in PRIMARY_TASKS:
-                    time.sleep(0.05)
-                    continue
+                model_name, (model, cams) = max(servable.items(), key=lambda kv: len(kv[1][1]))
                 batch_max = min(SLOT_BATCH, model["max_batch"])
                 taken: List[Tuple[CameraRuntime, Sample]] = []
                 for rt in cams:
@@ -312,10 +329,22 @@ class Shard:
             slot.close()
             client.close()
 
+    def _warn_unservable(self, name: str, model: Optional[dict]) -> None:
+        now = time.monotonic()
+        if now - self._unservable_warned.get(name, -1e9) < 60:
+            return
+        self._unservable_warned[name] = now
+        if model is None:
+            why = "has no active version"
+        else:
+            why = (f"is task={model.get('task', 'detect')} imgsz={model['imgsz']} row width {out_cols(model)}; "
+                   f"cameras need a {DETECT_SIZE}-px detect/pose model of width <= {SLOT_COLS}")
+        logger.warning("model %s %s: its cameras are not inferred", name, why)
+
     def _new_slot(self, client, index: int) -> ShmSlot:
         while not self.stop.is_set():
             try:
-                slot = ShmSlot(client, SLOT_BATCH, DETECT_SIZE)
+                slot = ShmSlot(client, SLOT_BATCH, DETECT_SIZE, out_shape=(300, SLOT_COLS))
                 logger.info("pipeline %d ready (shared-memory slot %s)", index, slot.in_name)
                 return slot
             except Exception as exc:
@@ -529,6 +558,8 @@ class Shard:
                                  data={"model": j.model, "model_version": model["version"], "trigger": j.reason}))
 
     def _emit(self, rt: CameraRuntime, ev: Event) -> None:
+        if rt.stopped:
+            return   # a job queued before the camera stopped or moved shard; its new runtime owns it now
         payload = {"camera_id": rt.id, "tenant_id": rt.spec.get("tenant_id"), "ts": ev.ts, "type": ev.type,
                    "rule": ev.rule, "track_id": ev.track_id, "class_name": ev.class_name,
                    "confidence": round(ev.confidence, 4) if ev.confidence is not None else None,

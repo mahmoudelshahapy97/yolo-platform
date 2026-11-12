@@ -228,14 +228,11 @@ class Worker:
                         low = min(conf, 0.1) if tracker else conf
                         if task == "pose":
                             dets = decode_pose(o, meta, names, kpt_shape, conf=low)
+                        elif task == "segment":
+                            # One decode; masks only for the detections that are reported (>= conf).
+                            dets = decode_segment(o, outs[1][k], meta, names, size, conf=low, mask_conf=conf)
                         else:
                             dets = decode_detections(o, meta, names, conf=low)
-                        if task == "segment":
-                            # Masks only for the detections that are reported (conf >= conf). Both lists are
-                            # the same rows sorted by confidence, so they are the first len(segs) of ``dets``.
-                            segs = decode_segment(o, outs[1][k], meta, names, size, conf=conf)
-                            for d, sd in zip(dets, segs):
-                                d.polygon = sd.polygon
                         tids = {}
                         if tracker:
                             b = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32).reshape(-1, 4)

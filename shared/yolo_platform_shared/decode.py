@@ -172,24 +172,33 @@ def decode_segment(
     conf: float = 0.25,
     classes: Optional[Sequence[int]] = None,
     max_det: int = 300,
+    mask_conf: Optional[float] = None,
 ) -> List[Detection]:
     """One image's [max_det, 6 + 32] output plus its [32, S/4, S/4] prototypes -> Detections with polygons.
 
     The same mask as ``full_masks`` (Ultralytics), but each box's logits are
     upsampled only over the box itself. The polygon is the largest outer contour,
     mapped to original pixels.
+
+    ``mask_conf`` (>= ``conf``): only detections at or above it get a polygon; the
+    rest keep ``polygon=None`` (e.g. low-confidence boxes kept just for tracking).
     """
     rows = select_rows(out, conf, classes, max_det)
+    if mask_conf is not None and mask_conf > conf:
+        # Rows are sorted best first, so the masked ones are a prefix.
+        rows_masked = rows[rows[:, 4] >= mask_conf]
+    else:
+        rows_masked = rows
     dets = _boxes(rows, meta, names)
-    if not dets:
+    if not len(rows_masked):
         return dets
     nm, mh, mw = protos.shape
-    logits = mask_logits(rows[:, 6:6 + nm], protos)
+    logits = mask_logits(rows_masked[:, 6:6 + nm], protos)
     scale = imgsz / mw
     vis_x0, vis_y0 = meta.pad_left, meta.pad_top
     vis_x1 = vis_x0 + int(round(meta.orig_w * meta.ratio))
     vis_y1 = vis_y0 + int(round(meta.orig_h * meta.ratio))
-    for d, lg, box in zip(dets, logits, rows[:, :4].astype(np.float32)):
+    for d, lg, box in zip(dets, logits, rows_masked[:, :4].astype(np.float32)):
         # Pixels c with box_x1 <= c < box_x2 (crop_mask), within the visible (unpadded) area.
         x0, y0 = max(int(np.ceil(box[0])), vis_x0), max(int(np.ceil(box[1])), vis_y0)
         x1, y1 = min(int(np.ceil(box[2])), vis_x1), min(int(np.ceil(box[3])), vis_y1)

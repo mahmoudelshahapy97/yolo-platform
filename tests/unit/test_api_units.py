@@ -101,3 +101,114 @@ def test_triton_load_config_overrides_only_version_policy():
     assert [int(v) for v in d["versionPolicy"]["specific"]["versions"]] == [1, 2]
     assert d["maxBatchSize"] == 16 and d["input"][0]["dataType"] == "TYPE_UINT8"
     assert d["dynamicBatching"]["preferredBatchSize"] == [4, 8, 16]
+
+
+# ---------------- review fixes 2026-11-12 ----------------
+
+# Route modules import app.metrics; the image's multiprocess dir is made by its entrypoint, not here.
+if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+    os.makedirs(os.environ["PROMETHEUS_MULTIPROC_DIR"], exist_ok=True)
+
+def _features(value):
+    from yolo_platform_shared.behavior import NUM_FEATURES, NUM_FRAMES, NUM_KEYPOINTS
+    w = [[[0.0] * NUM_FEATURES for _ in range(NUM_KEYPOINTS)] for _ in range(NUM_FRAMES)]
+    w[5][3][2] = value
+    return [w]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 1e39])
+def test_sequence_features_must_be_finite(bad):
+    from fastapi import HTTPException
+    from app.routes.sequences import _windows
+    from app.schemas import SequenceIn
+    with pytest.raises(HTTPException) as e:
+        _windows(SequenceIn(features=_features(bad)))
+    assert e.value.status_code == 422
+    assert _windows(SequenceIn(features=_features(0.5))).shape == (1, 120, 17, 12)
+
+
+class _Core:
+    def __init__(self, inflight, max_inflight=4):
+        from types import SimpleNamespace
+        self.inflight = inflight
+        self.settings = SimpleNamespace(max_inflight=max_inflight)
+        self.seen_inflight = None
+        core = self
+
+        class Inference:
+            async def sequences(self, windows, model):
+                core.seen_inflight = core.inflight
+                raise ValueError("stop here")
+        self.inference = Inference()
+
+
+def _request(core):
+    from types import SimpleNamespace
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(core=core)))
+
+
+def _principal():
+    return Principal(key_id="k", tenant_id="t", tenant_name="n", scopes=("infer",), model_allowlist=None,
+                     rate_per_min=60)
+
+
+def test_sequences_respect_and_count_inflight():
+    from fastapi import HTTPException
+    from app.routes import sequences
+    from app.schemas import SequenceIn
+    body = SequenceIn(features=_features(0.5))
+    full = _Core(inflight=4)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(sequences.infer_sequences(body, _request(full), _principal()))
+    assert e.value.status_code == 503 and full.inflight == 4
+    core = _Core(inflight=1)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(sequences.infer_sequences(body, _request(core), _principal()))
+    assert e.value.status_code == 422          # the stub's ValueError
+    assert core.seen_inflight == 2 and core.inflight == 1
+
+
+def test_camera_rejects_pose_models_wider_than_the_shard_slot():
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from app.routes import cameras
+    from app.services.model_registry import ActiveModel
+    from yolo_platform_shared.camera_config import CameraConfig
+
+    def core_with(kpt_shape):
+        m = ActiveModel("p", 1, "pose", 640, 8, {0: "person"}, kpt_shape=kpt_shape)
+
+        class Registry:
+            async def active(self, name):
+                return m
+        return SimpleNamespace(registry=Registry())
+
+    p = _principal()
+    asyncio.run(cameras._check_models(core_with((17, 3)), p, "p", CameraConfig()))
+    asyncio.run(cameras._check_models(core_with(None), p, "p", CameraConfig()))
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(cameras._check_models(core_with((21, 3)), p, "p", CameraConfig()))
+    assert e.value.status_code == 422 and "21 x 3" in e.value.detail
+
+
+def test_registry_reads_model_meta_once_per_version(tmp_path):
+    from app.services.model_registry import ModelRegistry
+    (tmp_path / "m" / "1").mkdir(parents=True)
+    (tmp_path / "m" / "1" / "model_meta.json").write_text(json.dumps({"imgsz": 640, "kpt_shape": [17, 3]}))
+    reg = ModelRegistry.__new__(ModelRegistry)
+    reg.repository = tmp_path
+    reg._io = {}
+    reads = []
+    real = ModelRegistry._meta
+    reg._meta = lambda n, v: reads.append((n, v)) or real(reg, n, v)
+
+    async def go():
+        a = await reg._io_fields("m", 1)
+        b = await reg._io_fields("m", 1)
+        missing = [await reg._io_fields("gone", 1) for _ in range(2)]
+        return a, b, missing
+    a, b, missing = asyncio.run(go())
+    assert a == b and a["kpt_shape"] == [17, 3]
+    assert reads.count(("m", 1)) == 1          # cached
+    assert reads.count(("gone", 1)) == 2       # absent meta is not cached
+    assert missing[0]["outputs"] == ["output0"]

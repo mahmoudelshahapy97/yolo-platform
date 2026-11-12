@@ -117,6 +117,8 @@ class ModelRegistry:
         self.drain_s = drain_s
         self._cache: Dict[str, ActiveModel] = {}
         self._cache_at = 0.0
+        # A version's model_meta.json does not change once registered: read it once, off the loop.
+        self._io: Dict[Tuple[str, int], dict] = {}
 
     # ---------- discovery ----------
 
@@ -188,13 +190,23 @@ class ModelRegistry:
         )
         cache = {}
         for r in rows:
-            io = io_fields(self._meta(r["model_name"], r["version"]))
+            io = await self._io_fields(r["model_name"], r["version"])
             cache[r["model_name"]] = ActiveModel(
                 r["model_name"], r["version"], r["task"], r["imgsz"], r["max_batch"],
                 {int(k): v for k, v in json.loads(r["names"]).items()}, input=io["input"],
                 outputs=tuple(io["outputs"]), kpt_shape=tuple(io["kpt_shape"]) if io["kpt_shape"] else None)
         self._cache = cache
         self._cache_at = time.monotonic()
+
+    async def _io_fields(self, name: str, version: int) -> dict:
+        key = (name, version)
+        io = self._io.get(key)
+        if io is None:
+            meta = await asyncio.to_thread(self._meta, name, version)
+            io = io_fields(meta)
+            if meta is not None:   # a missing file may still appear: only cache what was read
+                self._io[key] = io
+        return io
 
     # ---------- serving repository ----------
 

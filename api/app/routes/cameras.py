@@ -20,6 +20,7 @@ from ..services.auth import Principal
 router = APIRouter(prefix="/v1/cameras", tags=["cameras"])
 
 DESIRED_KEY = "cameras:desired"
+CAMERA_MAX_KPT_VALUES = 17 * 3   # must match workers/camera_shard.py SLOT_COLS - 6
 COLUMNS = "id, tenant_id, name, url, enabled, target_fps, model, config, created_at, updated_at"
 
 
@@ -93,6 +94,12 @@ async def _check_models(core, p: Principal, model: str, config) -> None:
                             f"camera model must be a detection or pose model, '{model}' is {primary.task}")
     if primary.imgsz != 640:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"camera model must take 640 px input, '{model}' takes {primary.imgsz}")
+    if primary.task == "pose":
+        k, d = primary.kpt_shape or (17, 3)
+        if k * d > CAMERA_MAX_KPT_VALUES:
+            # The shard's shared-memory output rows hold 6 box values + 17 keypoints x 3.
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"camera pose models can have at most 17 keypoints x 3, '{model}' has {k} x {d}")
     if config.shoplifting is not None:
         if primary.task != "pose":
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
