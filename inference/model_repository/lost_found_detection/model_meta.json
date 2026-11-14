@@ -1,0 +1,42 @@
+{
+  "name": "lost_found_detection",
+  "task": "detect",
+  "imgsz": 640,
+  "max_batch": 8,
+  "num_classes": 9,
+  "names": {
+    "0": "Glasses",
+    "1": "bags",
+    "2": "calculator",
+    "3": "keys",
+    "4": "mobile_phone",
+    "5": "person",
+    "6": "umbrella",
+    "7": "wallet",
+    "8": "watch"
+  },
+  "weights": "lost_found.pt",
+  "architecture": "DetectionModel",
+  "embedded_nms": true,
+  "end2end": true,
+  "input": {
+    "name": "images",
+    "dtype": "UINT8",
+    "dims": [
+      640,
+      640,
+      3
+    ]
+  },
+  "precision": "fp16",
+  "framework": "ultralytics",
+  "outputs": [
+    {
+      "name": "output0",
+      "shape": [
+        300,
+        6
+      ]
+    }
+  ]
+}

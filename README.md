@@ -28,12 +28,13 @@ gated model rollouts and Prometheus/Grafana monitoring.
 | `gender_detection` | gender.pt | detect (female, male, child) | 640 | InsightEye's production gender model |
 | `gender0_detection` | gender0.pt | detect (female, male) | 640 | InsightEye's older 2-class model; no names in the weights, InsightEye counts 0 = female, 1 = male |
 | `yolo26l_detection` | yolo26l.pt | detect (80 COCO classes) | 640 | large: more accurate, much more GPU time per frame than yolo26n |
+| `lost_found_detection` | lost_found.pt | detect (Glasses, bags, calculator, keys, mobile_phone, person, umbrella, wallet, watch) | 640 | lost-found / InsightEye abandoned-object model (YOLO26-M fine-tuned); person is class 5 |
 | `yolo26m_pose` | yolo26m-pose.pt | pose (person + 17 COCO keypoints) | 640 | camera model for `shoplifting` |
 | `yolo26n_seg` | yolo26n-seg.pt | segment (80 COCO classes) | 640 | masks returned as polygons |
 | `yolo11n_seg` | yolo11n-seg.pt | segment (80 COCO classes) | 640 | YOLO11 head, NMS embedded at export |
 | `shoplifting_seq` | shoplifting.pt | sequence (Normal, Shoplifting) | 120×17×12 FP32 | InsightEye's Conv1d → BiGRU → attention net over one person's pose window; FP32 engine |
 
-The last seven come from InsightEye (`/home/ubuntu/insighteye/models`). Its fire.pt, people.pt and
+The last eight come from InsightEye (`/home/ubuntu/insighteye/models`). Its fire.pt, people.pt and
 yolo26n.pt are the same files as `fire_detection`, `people_detection` and `yolo26n_detection`.
 
 Every box model has an end-to-end output `[N, 300, 6 + extras]` (x1 y1 x2 y2 conf class, NMS in the
