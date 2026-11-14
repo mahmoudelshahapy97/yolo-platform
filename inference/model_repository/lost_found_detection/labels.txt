@@ -1,0 +1,9 @@
+Glasses
+bags
+calculator
+keys
+mobile_phone
+person
+umbrella
+wallet
+watch

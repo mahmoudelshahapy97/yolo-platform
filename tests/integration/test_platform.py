@@ -62,7 +62,7 @@ def test_ready_reports_all_models(admin):
     r = admin.get("/health/ready").json()
     assert r["status"] == "ready"
     assert set(r["models"]) == {"yolo26n_detection", "people_detection", "fire_detection", "ppe_detection", "yolo26n_cls",
-                                "gender_detection", "gender0_detection", "yolo26l_detection", "yolo26m_pose",
+                                "gender_detection", "gender0_detection", "yolo26l_detection", "lost_found_detection", "yolo26m_pose",
                                 "yolo26n_seg", "yolo11n_seg", "shoplifting_seq"}
 
 
@@ -116,7 +116,7 @@ def test_revoked_key_is_rejected(admin, tenant_key):
 @pytest.mark.parametrize("model,image", [("yolo26n_detection", "street.jpg"), ("people_detection", "people.jpg"),
                                          ("ppe_detection", "street.jpg"), ("fire_detection", "fire.jpg"),
                                          ("gender_detection", "people.jpg"), ("gender0_detection", "people.jpg"),
-                                         ("yolo26l_detection", "street.jpg")])
+                                         ("yolo26l_detection", "street.jpg"), ("lost_found_detection", "street.jpg")])
 def test_detectors(admin, model, image):
     r = admin.post("/v1/infer/images", files={"file": img(image)}, data={"model": model, "conf": "0.2"})
     assert r.status_code == 200, r.text

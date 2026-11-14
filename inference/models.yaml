@@ -72,6 +72,15 @@ models:
     imgsz: 640
     max_batch: 8
     opt_batch: 4
+  # InsightEye / lost-found abandoned-object detector: YOLO26-M fine-tuned on 9
+  # classes (Glasses, bags, calculator, keys, mobile_phone, person, umbrella,
+  # wallet, watch); person is class 5. Added 2026-11-13. yolo26l_detection stays.
+  - name: lost_found_detection
+    weights: lost_found.pt
+    task: detect
+    imgsz: 640
+    max_batch: 8
+    opt_batch: 4
   - name: yolo26m_pose
     weights: yolo26m-pose.pt
     task: pose
