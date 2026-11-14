@@ -9,13 +9,14 @@ at export. Rows are sorted by confidence; padding rows have confidence 0.
   segment   32 mask coefficients; a second output holds the prototypes [32, S/4, S/4]
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from .preprocess import LetterboxMeta, scale_boxes
+from .tiling import Window, merge
 
 
 @dataclass
@@ -108,6 +109,32 @@ def _boxes(rows: np.ndarray, meta: LetterboxMeta, names: Dict[int, str]) -> List
         cid = int(cls)
         result.append(Detection(cid, names.get(cid, str(cid)), float(score), float(x1), float(y1), float(x2), float(y2)))
     return result
+
+
+def merge_windows(per_window: Sequence[List[Detection]], windows: Sequence[Window], iou: float = 0.5,
+                  agnostic: bool = False) -> List[Detection]:
+    """Detections of a tiled frame -> one set in frame pixels (tiling.merge).
+
+    ``per_window[k]`` holds window k's detections in that window's pixels (decode
+    with the window's own LetterboxMeta); keypoints move with their box. Per-class
+    by default, as the engines' own NMS is.
+    """
+    flat: List[Tuple[Detection, Window]] = []
+    rows = []
+    for dets, window in zip(per_window, windows):
+        r = [[d.x1, d.y1, d.x2, d.y2, len(flat) + i, d.confidence, d.class_id] for i, d in enumerate(dets)]
+        flat += [(d, window) for d in dets]
+        rows.append(np.asarray(r, dtype=np.float32).reshape(-1, 7))
+    out = []
+    for row in merge(rows, windows, iou=iou, agnostic=agnostic):
+        d, (dx, dy, _, _) = flat[int(row[4])]
+        kp = None
+        if d.keypoints is not None:
+            kp = d.keypoints.astype(np.float32, copy=True)
+            kp[:, 0] += dx
+            kp[:, 1] += dy
+        out.append(replace(d, x1=d.x1 + dx, y1=d.y1 + dy, x2=d.x2 + dx, y2=d.y2 + dy, keypoints=kp))
+    return out
 
 
 def scale_points(xy: np.ndarray, meta: LetterboxMeta) -> np.ndarray:

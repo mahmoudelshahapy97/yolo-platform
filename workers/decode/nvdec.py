@@ -78,7 +78,17 @@ class NvdecSource(FrameSource):
         self._ctx = shard_context()
         cp.cuda.Device(0).use()
         self._stream_obj = cp.cuda.Stream(non_blocking=True)
-        self._bufs = [cp.empty((size, size, 3), dtype=cp.uint8) for _ in range(2)]
+        self._bufs = self._alloc(1)
+
+    def _alloc(self, windows: int) -> list:
+        cp.cuda.Device(0).use()
+        return [cp.empty((windows, self.size, self.size, 3), dtype=cp.uint8) for _ in range(2)]
+
+    def _align(self, windows):
+        # NV12 chroma is subsampled 2x2: a window must start on an even pixel for its
+        # chroma pointer to land on a sample. Moving a tile one pixel left/up is harmless
+        # (the published windows are the aligned ones).
+        return [(x1 - x1 % 2, y1 - y1 % 2, x2, y2) for x1, y1, x2, y2 in windows]
 
     def _stream(self) -> None:
         cp.cuda.Device(0).use()
@@ -120,10 +130,17 @@ class NvdecSource(FrameSource):
                         self._mark_streaming()
                         if self._due(now):
                             y_ptr, y_pitch, uv_ptr, uv_pitch, w, h = nv12_planes(frame)
-                            meta = nv12_letterbox_gpu(y_ptr, y_pitch, uv_ptr, uv_pitch, w, h, self.size,
-                                                      self._bufs[self.back], self._stream_obj, bt709, full_range)
+                            windows = self._windows(w, h)
+                            buf = self._back_buffer(len(windows))
+                            # A window is the same planes from an offset pointer: the Y byte at
+                            # (x1, y1), and the interleaved UV pair at (x1/2, y1/2) = byte x1.
+                            metas = [nv12_letterbox_gpu(y_ptr + y1 * y_pitch + x1, y_pitch,
+                                                        uv_ptr + (y1 // 2) * uv_pitch + x1, uv_pitch,
+                                                        x2 - x1, y2 - y1, self.size, buf[k], self._stream_obj,
+                                                        bt709, full_range)
+                                     for k, (x1, y1, x2, y2) in enumerate(windows)]
                             self._stream_obj.synchronize()   # the surface is reused by the next Decode
-                            self._publish(meta, now)
+                            self._publish(metas, now, windows)
                 if pace:
                     left = pace - (time.monotonic() - t0)
                     if left > 0:
@@ -134,6 +151,6 @@ class NvdecSource(FrameSource):
             container.close()
 
     def _copy_out(self, index: int, dst) -> None:
-        # dst is a slot of the shard's shared-memory batch buffer (host). One D2H copy
-        # of the 640x640 input is all that crosses PCIe; the full frame never does.
-        self._bufs[index].get(out=dst)
+        # dst is the shard's shared-memory batch slots (host). One D2H copy of the
+        # 640x640 inputs is all that crosses PCIe; the full frame never does.
+        self._bufs[index][:len(dst)].get(out=dst)

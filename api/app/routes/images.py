@@ -11,15 +11,32 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from PIL import Image
+from yolo_platform_shared.camera_config import MAX_TILE_WINDOWS
+from yolo_platform_shared.tiling import TileConfig, parse_grid
 
 from .. import metrics
 from ..deps import check_model, require, state
 from ..schemas import InferResponse
 from ..services.auth import Principal
-from ..services.inference_service import ModelNotServing
+from ..services.inference_service import ModelNotServing, TilingUnsupported
 from ..services.triton_client import TritonUnavailable
 
+TILE_HELP = ("tiled inference for small objects: off (default), auto (images whose long side is >= 960 px) "
+             "or on; the image is inferred whole plus in tile_grid overlapping tiles and the boxes merged")
+
 router = APIRouter(prefix="/v1/infer", tags=["inference"])
+
+
+def _tiling(mode: str, grid: str) -> Optional[TileConfig]:
+    if mode == "off":
+        return None
+    try:
+        cfg = TileConfig(mode=mode, grid=parse_grid(grid))
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"tile_grid: {exc}")
+    if 1 + cfg.grid[0] * cfg.grid[1] > MAX_TILE_WINDOWS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"tile_grid: at most {MAX_TILE_WINDOWS - 1} tiles")
+    return cfg
 
 
 def _parse_ids(raw: Optional[str], field: str) -> Optional[List[int]]:
@@ -67,8 +84,9 @@ def _decode(data: bytes, max_pixels: int) -> Optional[np.ndarray]:
 
 async def _run(request: Request, p: Principal, endpoint: str, files: List[UploadFile], model: str, conf: float,
                classes: Optional[str], max_det: int, classify_model: Optional[str], classify_classes: Optional[str],
-               top_k: int) -> InferResponse:
+               top_k: int, tile: str = "off", tile_grid: str = "2x2") -> InferResponse:
     core = state(request)
+    tiling = _tiling(tile, tile_grid)
     check_model(p, model)
     if classify_model:
         check_model(p, classify_model)
@@ -94,10 +112,13 @@ async def _run(request: Request, p: Principal, endpoint: str, files: List[Upload
             m, cm, results, timing = await core.inference.detect(
                 images, model, conf=conf, classes=_parse_ids(classes, "classes"), max_det=max_det,
                 classify_model=classify_model, classify_classes=_parse_ids(classify_classes, "classify_classes"),
-                top_k=top_k)
+                top_k=top_k, tiling=tiling)
     except ModelNotServing as exc:
         metrics.ERRORS.labels(model, endpoint, "not_serving").inc()
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    except TilingUnsupported as exc:
+        metrics.ERRORS.labels(model, endpoint, "http_422").inc()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
     except TritonUnavailable as exc:
         metrics.ERRORS.labels(model, endpoint, "triton_unavailable").inc()
         metrics.REJECTED.labels("triton_queue").inc()
@@ -137,9 +158,12 @@ async def infer_image(
     classify_model: Optional[str] = Form(None, description="classify each detection crop with this model"),
     classify_classes: Optional[str] = Form(None, description="only classify detections of these class ids"),
     top_k: int = Form(1, ge=1, le=10),
+    tile: str = Form("off", pattern="^(off|auto|on)$", description=TILE_HELP),
+    tile_grid: str = Form("2x2", description="tile columns x rows, e.g. 2x2 or 3x2"),
     p: Principal = Depends(require("infer")),
 ):
-    return await _run(request, p, "images", [file], model, conf, classes, max_det, classify_model, classify_classes, top_k)
+    return await _run(request, p, "images", [file], model, conf, classes, max_det, classify_model, classify_classes, top_k,
+                      tile, tile_grid)
 
 
 @router.post("/batch", response_model=InferResponse, response_model_exclude_none=True)
@@ -153,6 +177,8 @@ async def infer_batch(
     classify_model: Optional[str] = Form(None),
     classify_classes: Optional[str] = Form(None),
     top_k: int = Form(1, ge=1, le=10),
+    tile: str = Form("off", pattern="^(off|auto|on)$", description=TILE_HELP),
+    tile_grid: str = Form("2x2"),
     p: Principal = Depends(require("infer")),
 ):
     # The rate limit charges one token per image (checked again here: the dependency charged one).
@@ -161,4 +187,5 @@ async def infer_batch(
         metrics.REJECTED.labels("rate_limit").inc()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded",
                             headers={"Retry-After": str(max(1, int(retry + 0.999)))})
-    return await _run(request, p, "batch", files, model, conf, classes, max_det, classify_model, classify_classes, top_k)
+    return await _run(request, p, "batch", files, model, conf, classes, max_det, classify_model, classify_classes, top_k,
+                      tile, tile_grid)

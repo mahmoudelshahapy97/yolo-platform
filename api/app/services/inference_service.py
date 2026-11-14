@@ -15,8 +15,10 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-from yolo_platform_shared.decode import decode_classification, decode_detections, decode_pose, decode_segment
+from yolo_platform_shared.decode import (decode_classification, decode_detections, decode_pose, decode_segment,
+                                         merge_windows)
 from yolo_platform_shared.preprocess import classify_crop, letterbox
+from yolo_platform_shared.tiling import TileConfig, crops as window_crops, plan_windows
 
 from .model_registry import ActiveModel, ModelRegistry
 from .triton_client import TritonClient
@@ -43,6 +45,10 @@ class Timings:
     def to_dict(self, total_ms: float) -> dict:
         return {"preprocess_ms": round(self.preprocess_ms, 2), "inference_ms": round(self.inference_ms, 2),
                 "postprocess_ms": round(self.postprocess_ms, 2), "total_ms": round(total_ms, 2)}
+
+
+class TilingUnsupported(ValueError):
+    """Tiling was asked of a model whose outputs cannot be merged (segmentation)."""
 
 
 @dataclass
@@ -122,23 +128,36 @@ class InferenceService:
     async def detect(self, images: List[np.ndarray], model_name: str, conf: float = 0.25,
                      classes: Optional[Sequence[int]] = None, max_det: int = 300,
                      classify_model: Optional[str] = None, classify_classes: Optional[Sequence[int]] = None,
-                     top_k: int = 1) -> tuple[ActiveModel, Optional[ActiveModel], List[ImageResult], Timings]:
+                     top_k: int = 1, tiling: Optional[TileConfig] = None,
+                     ) -> tuple[ActiveModel, Optional[ActiveModel], List[ImageResult], Timings]:
         model = await self._model(model_name, BOX_TASKS)
         adapter = DetectionAdapter(model)
+        # Tiling: each image becomes its windows (whole image first), inferred like a
+        # batch of images and merged back per image (yolo_platform_shared/tiling.py).
+        windows = [plan_windows(img.shape[1], img.shape[0], tiling) if tiling else [(0, 0, img.shape[1], img.shape[0])]
+                   for img in images]
+        if model.task == "segment" and any(len(w) > 1 for w in windows):
+            raise TilingUnsupported("tiling is not available for segmentation models")
+        inputs = [c for img, w in zip(images, windows) for c in window_crops(img, w)]
         t = Timings()
         s = time.perf_counter()
-        batch, metas = await asyncio.to_thread(adapter.preprocess, images)
+        batch, metas = await asyncio.to_thread(adapter.preprocess, inputs)
         t.preprocess_ms += _ms(s)
         s = time.perf_counter()
         outputs = await self._run_all(model, batch)
         t.inference_ms += _ms(s)
         s = time.perf_counter()
         # Mask contours cost a few ms per image: off the event loop.
-        per_image = await asyncio.to_thread(adapter.decode, outputs, metas, conf, classes, max_det)
+        per_input = await asyncio.to_thread(adapter.decode, outputs, metas, conf, classes, max_det)
+        per_image, at = [], 0
+        for w in windows:
+            group = per_input[at:at + len(w)]
+            at += len(w)
+            per_image.append(group[0] if len(w) == 1 else merge_windows(group, w, iou=tiling.merge_iou)[:max_det])
         t.postprocess_ms += _ms(s)
 
-        results = [ImageResult(width=m.orig_w, height=m.orig_h, detections=[d.to_dict() for d in dets])
-                   for m, dets in zip(metas, per_image)]
+        results = [ImageResult(width=img.shape[1], height=img.shape[0], detections=[d.to_dict() for d in dets])
+                   for img, dets in zip(images, per_image)]
 
         cls_model = None
         if classify_model:

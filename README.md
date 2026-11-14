@@ -175,6 +175,25 @@ Limits:
 **Use the camera's substream** (e.g. 640×360 or D1) wherever its resolution is enough for detection.
 The detector sees 640×640 either way, and NVDEC and network costs grow with the stream's pixel count.
 
+**Tiling** (`config.tiling`, [shared/yolo_platform_shared/tiling.py](shared/yolo_platform_shared/tiling.py)) is for
+streams where people or objects are too small at 640 px: a high, wide 1080p view, or small items.
+
+```json
+"config": {"tiling": {"mode": "auto", "grid": "2x2", "overlap": 0.2, "min_side": 960, "merge_iou": 0.5}}
+```
+
+- A tiled frame is inferred whole and in `grid` overlapping tiles. The boxes are merged:
+  - a tile's box cut by the tile's edge is dropped when another window sees the object whole;
+  - boxes of one class from different windows overlapping by `merge_iou` (or one ≥80% inside the other) are one object;
+  - keypoints move with their box.
+- On 1080p, 2×2 tiles magnify about 1.8× at **5 inferences per frame**. `grid` accepts up to 15 tiles (16 windows, the size of one shard batch slot).
+- **`auto` is the default for every camera.** It tiles frames whose long side reaches `min_side` (960), so 1080p main streams are tiled and substreams are not. Set `"mode": "off"` on a 1080p camera to keep it at one pass; `"on"` tiles any resolution.
+- **Decode:** each window is letterboxed straight from the decoded NV12 frame on the GPU (offset plane pointers; tile origins rounded to even pixels for chroma). Windows fill one batch slot each.
+- **Batching:** a round of the pipeline holds up to the model's `max_batch` slots. A tiled frame larger than that goes alone, in `max_batch` chunks.
+- **Whole frame only:** rules, triggered models and crop classification use the whole-frame window, as before.
+- **Metrics:** `shard_windows_total` counts windows per model. Divided by `camera_inferred_frames_total`, it gives the tiling cost.
+- **Images and videos:** `POST /v1/infer/images`, `/v1/infer/batch` and `/v1/infer/videos` take `tile=off|auto|on` (default `off`) and `tile_grid`. Not for segmentation models.
+
 ## How camera processing works
 
 - **Shards and decode:**
@@ -306,6 +325,20 @@ These figures were measured on 2026-11-04 with `tools/bench.py`.
 | 25 | 125.0 | 5.00 | 0% | 45 ms | 54 | 53 | 45 | yes |
 | 40 | 200.1 | 5.00 | 0% | 48 ms | 75 | 91 | 68 | yes |
 | 55 | 270.4 | 4.86 | 0% | 91 ms | 79 | **99** | 86 | yes, NVDEC saturated |
+
+**Tiling, 1080p main streams, `lost_found_detection` (YOLO26-M), NVDEC** (2026-11-14, one shard × 2 pipelines, `bench.py --tiling off|auto`)
+
+| Tiling | Cameras | Inferred fps | Min fps/cam | Dropped | p95 latency | Avg Triton batch | Keeps up |
+|---|---|---|---|---|---|---|---|
+| off | 30 | 149.9 | 4.97 | 0% | 94 ms | 3.0 | yes |
+| off | 40 | 171.7 | 4.17 | 13.3% | 247 ms | 8.0 | no |
+| auto (2×2 + whole) | 4 | 20.0 | 5.00 | 0% | 49 ms | 5.0 | yes |
+| auto (2×2 + whole) | 8 | 38.9 | 4.77 | 2.8% | 269 ms | 5.0 | yes |
+| auto (2×2 + whole) | 12 | 38.1 | 3.15 | 36.7% | 281 ms | 5.0 | no |
+
+- With YOLO26-M the GPU is the limit in both modes, at ≈170–190 model inferences/s. Tiling spends 5 of them per frame, so **a T4 holds about 8 tiled 1080p cameras at 5 fps against about 30 untiled**.
+- A tiled frame (5 windows) does not share a request with another one at the engine's `max_batch` 8, so tiled requests are 5 inputs each.
+- Budget tiling per camera: leave substream cameras untiled (`auto` already does), and set `"mode": "off"` on 1080p cameras that only need large objects.
 
 **Substreams, CPU decode (OpenCV, `DECODE_BACKEND=cpu`)**: 25 cameras keep up at 71% CPU. At 50 cameras the CPU is at 100%, only 191 of 250 fps get through, and 23% of frames drop.
 

@@ -212,3 +212,80 @@ def test_registry_reads_model_meta_once_per_version(tmp_path):
     assert reads.count(("m", 1)) == 1          # cached
     assert reads.count(("gone", 1)) == 2       # absent meta is not cached
     assert missing[0]["outputs"] == ["output0"]
+
+
+# ------------------------------------------------------------------ tiling (images API)
+def _bag_triton(calls):
+    """A Triton stand-in for a detector: one 'bag' (class 1) box around the pixels of
+    value 200 in each letterboxed input, in model space."""
+    import numpy as np
+
+    class Triton:
+        async def infer_many(self, name, version, batch, outputs, input_name):
+            calls.append(len(batch))
+            out = np.zeros((len(batch), 300, 6), dtype=np.float32)
+            for i, img in enumerate(batch):
+                ys, xs = np.nonzero(img[..., 0] == 200)
+                if len(xs):
+                    out[i, 0] = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1, 0.9, 1]
+            return [out]
+    return Triton()
+
+
+def _service(task="detect", calls=None):
+    from app.services.inference_service import InferenceService
+    from app.services.model_registry import ActiveModel
+
+    m = ActiveModel("det", 1, task, 640, 8, {0: "person", 1: "bag"})
+
+    class Registry:
+        async def active(self, name):
+            return m
+    return InferenceService(_bag_triton(calls if calls is not None else []), Registry())
+
+
+def _hd_with_bag():
+    import numpy as np
+
+    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    img[600:700, 1500:1600] = 200  # BGR: channel 0 stays 200 after the RGB swap too
+    return img
+
+
+def test_tiled_image_detect_infers_every_window_and_merges():
+    from yolo_platform_shared.tiling import TileConfig
+
+    calls = []
+    _, _, results, _ = asyncio.run(_service(calls=calls).detect([_hd_with_bag()], "det", tiling=TileConfig(mode="on")))
+    assert calls == [5]  # whole image + 2x2 tiles, one request (max_batch 8)
+    dets = results[0].detections
+    assert (results[0].width, results[0].height) == (1920, 1080)
+    assert len(dets) == 1 and dets[0]["class_name"] == "bag"
+    box = dets[0]["bbox"]
+    assert abs(box["x1"] - 1500) <= 3 and abs(box["y1"] - 600) <= 3 and abs(box["x2"] - 1600) <= 3
+
+
+def test_untiled_image_detect_is_one_input_per_image():
+    calls = []
+    _, _, results, _ = asyncio.run(_service(calls=calls).detect([_hd_with_bag(), _hd_with_bag()], "det"))
+    assert calls == [2] and all(len(r.detections) == 1 for r in results)
+
+
+def test_tiling_is_refused_for_segmentation():
+    from app.services.inference_service import TilingUnsupported
+    from yolo_platform_shared.tiling import TileConfig
+
+    with pytest.raises(TilingUnsupported):
+        asyncio.run(_service("segment").detect([_hd_with_bag()], "det", tiling=TileConfig(mode="on")))
+
+
+def test_tile_form_fields():
+    from fastapi import HTTPException
+    from app.routes.images import _tiling
+
+    assert _tiling("off", "nonsense") is None
+    assert _tiling("auto", "3x2").grid == (3, 2)
+    for grid in ("4x4", "2by2"):
+        with pytest.raises(HTTPException) as e:
+            _tiling("on", grid)
+        assert e.value.status_code == 422

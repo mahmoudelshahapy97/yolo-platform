@@ -18,13 +18,24 @@ A rule's ``classify`` runs a classifier on the crop of the object that fired it.
 ``shoplifting`` (pose camera models only) keeps a window of every tracked
 person's pose and judges it with a sequence model (``shoplifting_seq``); see
 behavior.py. Alerts are events of type ``shoplifting``.
+
+``tiling`` runs the camera's primary model on overlapping tiles as well as the
+whole frame and merges the boxes (tiling.py), so far-away people and small
+objects are seen magnified. ``auto`` (the default) tiles only frames whose long
+side is at least ``min_side``: a 1080p main stream is tiled (2x2: 5 inferences
+per frame), a 640x360 substream is not. ``off`` restores one pass per frame.
 """
 
 from typing import List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .tiling import TileConfig, parse_grid
+
 Point = Tuple[float, float]
+
+# A tiled frame's windows (whole frame + tiles) must fit one shard batch slot.
+MAX_TILE_WINDOWS = 16
 
 
 class Classify(BaseModel):
@@ -109,6 +120,30 @@ class Shoplifting(BaseModel):
     camera_cooldown_s: float = Field(30.0, ge=0, le=86400)
 
 
+class Tiling(BaseModel):
+    mode: Literal["off", "auto", "on"] = "auto"
+    grid: str = "2x2"  # columns x rows
+    overlap: float = Field(0.2, ge=0.0, le=0.5)
+    min_side: int = Field(960, ge=0, le=16384)
+    # Boxes from different windows overlapping at least this much are one object.
+    merge_iou: float = Field(0.5, ge=0.05, le=0.95)
+
+    @field_validator("grid")
+    @classmethod
+    def _grid(cls, v: str) -> str:
+        try:
+            cols, rows = parse_grid(v)
+        except ValueError:
+            raise ValueError(f"grid must look like '2x2', not {v!r}") from None
+        if cols < 1 or rows < 1 or 1 + cols * rows > MAX_TILE_WINDOWS:
+            raise ValueError(f"grid {cols}x{rows} needs {1 + cols * rows} windows; at most {MAX_TILE_WINDOWS}")
+        return f"{cols}x{rows}"
+
+    def tile_config(self) -> TileConfig:
+        return TileConfig(mode=self.mode, grid=parse_grid(self.grid), overlap=self.overlap,
+                          min_side=self.min_side, merge_iou=self.merge_iou)
+
+
 class CameraConfig(BaseModel):
     rules: List[Rule] = Field(default_factory=list)
     triggered: List[TriggeredModel] = Field(default_factory=list)
@@ -117,6 +152,7 @@ class CameraConfig(BaseModel):
     detect_confidence: float = Field(0.25, ge=0.05, le=1.0)
     # Restrict the primary detector to these class names (None = all).
     classes: Optional[List[str]] = None
+    tiling: Tiling = Field(default_factory=Tiling)
 
     @model_validator(mode="after")
     def _refs(self):

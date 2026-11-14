@@ -37,8 +37,9 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from redis import Redis
 from redis.exceptions import ResponseError
 
-from yolo_platform_shared.decode import decode_detections, decode_pose, decode_segment
+from yolo_platform_shared.decode import decode_detections, decode_pose, decode_segment, merge_windows
 from yolo_platform_shared.preprocess import letterbox
+from yolo_platform_shared.tiling import TileConfig, crops, parse_grid, plan_windows
 
 from .tracking import ByteTracker
 from .triton_io import ActiveModels, infer_outputs, model_outputs
@@ -205,6 +206,12 @@ class Worker:
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
             w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             step = max(1, int(round(fps / sample_fps)))
+            # Tiling (params tile/tile_grid, never for segmentation): each sampled frame is
+            # inferred whole plus in overlapping tiles and the boxes merged.
+            tiling = None
+            if params.get("tile", "off") != "off" and task != "segment":
+                tiling = TileConfig(mode=params["tile"], grid=parse_grid(params.get("tile_grid", "2x2")))
+            windows = plan_windows(w, h, tiling) if tiling else [(0, 0, w, h)]
             expected = (total + step - 1) // step if total else None
             with self._db() as conn:
                 conn.execute("UPDATE job SET total_frames = %s WHERE id = %s", (expected, job_id))
@@ -221,18 +228,31 @@ class Worker:
                     nonlocal processed
                     if not pending:
                         return
-                    lbs = [letterbox(f, size) for _, f in pending]
-                    outs = infer_outputs(self.triton, model["serve_name"], 1, np.stack([lb for lb, _ in lbs]),
-                                         model_outputs(model), timeout_s=30.0)
-                    for k, ((fi, frame), (_, meta), o) in enumerate(zip(pending, lbs, outs[0])):
-                        low = min(conf, 0.1) if tracker else conf
+                    n_win = len(windows)
+                    lbs = [letterbox(c, size) for _, f in pending for c in crops(f, windows)]
+                    batch = np.stack([lb for lb, _ in lbs])
+                    # Tiled frames can exceed the engine's batch: send max_batch at a time.
+                    parts = [infer_outputs(self.triton, model["serve_name"], 1, batch[i:i + max_batch],
+                                           model_outputs(model), timeout_s=30.0)
+                             for i in range(0, len(batch), max_batch)]
+                    outs = [np.concatenate([part[j] for part in parts]) for j in range(len(parts[0]))]
+                    low = min(conf, 0.1) if tracker else conf
+
+                    def decode(k):
+                        o, meta = outs[0][k], lbs[k][1]
                         if task == "pose":
-                            dets = decode_pose(o, meta, names, kpt_shape, conf=low)
-                        elif task == "segment":
+                            return decode_pose(o, meta, names, kpt_shape, conf=low)
+                        if task == "segment":
                             # One decode; masks only for the detections that are reported (>= conf).
-                            dets = decode_segment(o, outs[1][k], meta, names, size, conf=low, mask_conf=conf)
+                            return decode_segment(o, outs[1][k], meta, names, size, conf=low, mask_conf=conf)
+                        return decode_detections(o, meta, names, conf=low)
+
+                    for k, (fi, frame) in enumerate(pending):
+                        if n_win == 1:
+                            dets = decode(k)
                         else:
-                            dets = decode_detections(o, meta, names, conf=low)
+                            dets = merge_windows([decode(k * n_win + j) for j in range(n_win)], windows,
+                                                 iou=tiling.merge_iou)
                         tids = {}
                         if tracker:
                             b = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32).reshape(-1, 4)

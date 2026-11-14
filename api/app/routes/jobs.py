@@ -13,6 +13,7 @@ from .. import metrics
 from ..deps import check_model, require, state, ws_principal
 from ..schemas import JobOut
 from ..services.auth import Principal
+from .images import TILE_HELP, _tiling
 
 router = APIRouter(tags=["jobs"])
 
@@ -46,14 +47,19 @@ async def submit_video(
     conf: float = Form(0.25, ge=0.01, le=1.0),
     annotate: bool = Form(False, description="also render an annotated MP4"),
     track: bool = Form(True, description="assign track ids (ByteTrack)"),
+    tile: str = Form("off", pattern="^(off|auto|on)$", description=TILE_HELP),
+    tile_grid: str = Form("2x2", description="tile columns x rows, e.g. 2x2 or 3x2"),
     p: Principal = Depends(require("jobs")),
 ):
     core = state(request)
     check_model(p, model)
+    tiling = _tiling(tile, tile_grid)
     active = await core.registry.active(model)
     if active is None or active.task not in ("detect", "pose", "segment"):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             f"'{model}' is not a serving detection, pose or segmentation model")
+    if tiling is not None and active.task == "segment":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "tiling is not available for segmentation models")
     if (file.content_type or "application/octet-stream") not in VIDEO_TYPES:
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, f"unsupported content type {file.content_type}")
     backlog = await core.pool.fetchval("SELECT count(*) FROM job WHERE status = 'queued'")
@@ -80,6 +86,8 @@ async def submit_video(
 
     params = {"sample_fps": sample_fps, "conf": conf, "annotate": annotate, "track": track,
               "filename": file.filename, "bytes": size}
+    if tiling is not None:
+        params.update(tile=tile, tile_grid=f"{tiling.grid[0]}x{tiling.grid[1]}")
     await core.pool.execute(
         "INSERT INTO job (id, tenant_id, model, params, input_key) VALUES ($1, $2::uuid, $3, $4, $5)",
         job_id, p.tenant_id, model, json.dumps(params), key)

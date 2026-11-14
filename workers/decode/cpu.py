@@ -25,8 +25,11 @@ class CpuSource(FrameSource):
 
     def __init__(self, camera_id: str, url: str, target_fps: float, size: int) -> None:
         super().__init__(camera_id, url, target_fps, size)
-        self._bufs = [np.empty((size, size, 3), dtype=np.uint8) for _ in range(2)]
+        self._bufs = self._alloc(1)
         self._cap = None
+
+    def _alloc(self, windows: int) -> list:
+        return [np.empty((windows, self.size, self.size, 3), dtype=np.uint8) for _ in range(2)]
 
     def _stream(self) -> None:
         url = self.url[len("file://"):] if self.url.startswith("file://") else self.url
@@ -52,8 +55,11 @@ class CpuSource(FrameSource):
                 if self._due(now):
                     ok, frame = cap.retrieve(frame)
                     if ok:
-                        _, meta = letterbox(frame, self.size, out=self._bufs[self.back])
-                        self._publish(meta, now)
+                        windows = self._windows(frame.shape[1], frame.shape[0])
+                        buf = self._back_buffer(len(windows))
+                        metas = [letterbox(frame[y1:y2, x1:x2], self.size, out=buf[k])[1]
+                                 for k, (x1, y1, x2, y2) in enumerate(windows)]
+                        self._publish(metas, now, windows)
                 if pace:
                     left = pace - (time.monotonic() - t0)
                     if left > 0:
@@ -63,4 +69,4 @@ class CpuSource(FrameSource):
             self._cap = None
 
     def _copy_out(self, index: int, dst) -> None:
-        dst[...] = self._bufs[index]
+        dst[...] = self._bufs[index][:len(dst)]
