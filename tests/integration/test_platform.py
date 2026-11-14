@@ -267,8 +267,9 @@ def test_pose_camera_raises_shoplifting_events(admin):
         assert e["rule"] == "shoplifting" and e["track_id"] is not None and e["bbox"]
         assert 0 <= e["data"]["probability"] <= 1 and e["data"]["model"] == "shoplifting_seq"
         assert e["data"]["window_samples"] >= 3
-        s = admin.get(f"/v1/cameras/{cid}").json()["status"]
-        assert s["state"] == "streaming" and s["fps"] >= 3.0
+        # Status is published every 2 s and events can beat the first "streaming" one.
+        wait_for(lambda: (lambda s: s if s and s["state"] == "streaming" and s["fps"] >= 3.0 else None)(
+            admin.get(f"/v1/cameras/{cid}").json()["status"]), 30, what="pose camera streaming")
         # The rules still run on the pose model's boxes.
         assert any(x["rule"] == "people" for x in admin.get(f"/v1/cameras/{cid}/events").json())
     finally:
@@ -440,3 +441,57 @@ def test_deploy_requires_admin(admin):
     r = admin.post("/v1/admin/keys", json={"tenant": "default", "name": "infer-only", "scopes": ["infer"]})
     with client(r.json()["api_key"]) as c:
         assert c.post("/v1/models/yolo26n_detection/versions/1/deploy").status_code == 403
+
+
+def _clip4_frame_jpeg():
+    """A frame of the high, wide crowd view (main/clip4.mp4, 1920x1080)."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(VIDEOS / "main" / "clip4.mp4"))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 170)
+    ok, frame = cap.read()
+    cap.release()
+    assert ok, "main/clip4.mp4 is missing (tools/gen_substreams.sh)"
+    return ("crowd.jpg", cv2.imencode(".jpg", frame)[1].tobytes(), "image/jpeg")
+
+
+def test_image_tiling_finds_the_crowd(admin):
+    def people(tile):
+        r = admin.post("/v1/infer/images", files={"file": _clip4_frame_jpeg()},
+                       data={"model": "lost_found_detection", "conf": "0.25", "tile": tile})
+        assert r.status_code == 200, r.text
+        return sum(d["class_name"] == "person" for d in r.json()["images"][0]["detections"])
+
+    plain, tiled = people("off"), people("on")
+    assert tiled >= 10 and tiled >= 3 * max(plain, 1), (plain, tiled)
+    r = admin.post("/v1/infer/images", files={"file": img("street.jpg")},
+                   data={"model": "yolo26n_seg", "tile": "on"})
+    assert r.status_code == 422
+
+
+def test_tiled_camera_on_a_1080p_stream(admin):
+    # Untiled, lost_found_detection sees ~2 people per frame here; tiled (auto, the
+    # default, on a 1080p stream) ~20. The rule only fires if tiles reach the tracker.
+    body = {"name": f"e2e-tiled-{uuid.uuid4().hex[:6]}", "url": "rtsp://mediamtx:8554/main4", "target_fps": 5,
+            "model": "lost_found_detection",
+            "config": {"rules": [{"name": "crowd", "type": "count_above", "count": 10, "classes": ["person"],
+                                  "cooldown_s": 2}]}}
+    cam = admin.post("/v1/cameras", json=body)
+    assert cam.status_code == 201, cam.text
+    cid = cam.json()["id"]
+    try:
+        assert cam.json()["config"]["tiling"]["mode"] == "auto"
+        assert admin.post(f"/v1/cameras/{cid}/start").json()["enabled"] is True
+
+        def streaming():
+            s = admin.get(f"/v1/cameras/{cid}").json()["status"]
+            return s if s and s["state"] == "streaming" and s["fps"] >= 4.0 else None
+
+        wait_for(streaming, 120, what="tiled 1080p camera streaming at ~5 fps")
+        events = wait_for(lambda: [e for e in admin.get(f"/v1/cameras/{cid}/events").json() if e["rule"] == "crowd"],
+                          90, what="crowd event from tiled detections")
+        assert events[0]["camera_id"] == cid
+        bad = admin.patch(f"/v1/cameras/{cid}", json={"config": {"tiling": {"grid": "4x4"}}})
+        assert bad.status_code == 422
+    finally:
+        assert admin.delete(f"/v1/cameras/{cid}").status_code == 204

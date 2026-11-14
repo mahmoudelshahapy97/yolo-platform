@@ -45,7 +45,7 @@ run_worker "python -m pytest -q -p no:cacheprovider tests/unit --ignore=tests/un
 run_api "python -m pytest -q -p no:cacheprovider tests/unit/test_api_units.py tests/unit/test_shared.py"
 
 echo "== integration tests (through nginx)"
-run_api "E2E_BASE=https://nginx E2E_MODELS=/models E2E_VIDEOS=/videos python -m pytest -q -p no:cacheprovider tests/integration ${PYTEST_K:+-k $PYTEST_K}"
+run_api "E2E_BASE=https://nginx E2E_MODELS=/models E2E_VIDEOS=/videos python -m pytest -q -p no:cacheprovider tests/integration ${PYTEST_K:+-k \"$PYTEST_K\"}"
 
 echo "== drill: kill a camera shard, its cameras move to the other one"
 "${DC[@]}" up -d --no-deps --scale camera-shard=2 camera-shard >/dev/null 2>&1

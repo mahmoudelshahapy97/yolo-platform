@@ -40,7 +40,7 @@ from redis import Redis
 
 from yolo_platform_shared.behavior import SHOPLIFTING_CLASS, Person, ShopliftingParams, ShopliftingTracker, keypoints_xyn
 from yolo_platform_shared.camera_config import CameraConfig
-from yolo_platform_shared.decode import decode_detections, decode_pose
+from yolo_platform_shared.decode import decode_detections, decode_pose, merge_windows
 from yolo_platform_shared.preprocess import LetterboxMeta, classify_crop, letterbox
 
 from .decode.base import FrameSource, Sample
@@ -62,6 +62,8 @@ PRIMARY_TASKS = ("detect", "pose")
 M_ACTIVE = Gauge("active_cameras", "Cameras owned by this shard", ["shard"])
 M_STREAMING = Gauge("streaming_cameras", "Cameras currently streaming", ["shard"])
 M_FPS = Gauge("camera_fps", "Inferred frames per second (last 10 s)", ["camera"])
+M_WINDOWS = Counter("shard_windows_total", "Windows inferred: a frame is 1, a tiled frame its whole view + tiles",
+                    ["model"])
 M_INFERRED = Counter("camera_inferred_frames_total", "Frames inferred", ["camera"])
 M_DROPPED = Counter("camera_dropped_frames_total", "Sampled frames dropped before inference (stale)", ["camera"])
 M_DECODED = Counter("camera_decoded_frames_total", "Frames decoded", ["camera"])
@@ -188,6 +190,7 @@ class Shard:
         config = CameraConfig.model_validate(spec.get("config") or {})
         fps = float(spec.get("target_fps", 5))
         src = make_source(self.s.backend, cam_id, spec["url"], fps)
+        src.set_tiling(config.tiling.tile_config())
         rt = CameraRuntime(cam_id, spec, config, src, ByteTracker(frame_rate=fps), RulesEngine(config))
         params = shoplifting_params(config)
         rt.shoplifting = ShopliftingTracker(params) if params else None
@@ -236,6 +239,7 @@ class Shard:
                 else:
                     rt.shoplifting.set_params(params)   # keep people's windows
                 rt.source.set_fps(float(spec["target_fps"]))
+                rt.source.set_tiling(config.tiling.tile_config())
                 rt.tracker.set_frame_rate(float(spec["target_fps"]))
             logger.info("camera %s: config updated", cam_id)
 
@@ -285,18 +289,30 @@ class Shard:
                     continue
                 model_name, (model, cams) = max(servable.items(), key=lambda kv: len(kv[1][1]))
                 batch_max = min(SLOT_BATCH, model["max_batch"])
-                taken: List[Tuple[CameraRuntime, Sample]] = []
+                # Slots, not frames: a tiled sample fills one per window. A round holds up to
+                # batch_max slots (one Triton request), or one tiled sample larger than that,
+                # which is then sent in batch_max chunks.
+                taken: List[Tuple[CameraRuntime, Sample, int]] = []
+                used = 0
                 for rt in cams:
-                    if len(taken) >= batch_max:
-                        break
-                    sample = rt.source.take(slot.inputs[len(taken)])
+                    need = rt.source.fresh_windows()
+                    if not need:
+                        continue
+                    room = batch_max if used else max(batch_max, min(need, SLOT_BATCH))
+                    if used + need > room:
+                        continue
+                    sample = rt.source.take(slot.inputs[used:room])
                     if sample is not None:
-                        taken.append((rt, sample))
+                        taken.append((rt, sample, used))
+                        used += len(sample.windows)
                 if not taken:
                     continue
                 t0 = time.perf_counter()
                 try:
-                    out = slot.infer(model["serve_name"], 1, len(taken), out_cols=out_cols(model))
+                    for start in range(0, used, batch_max):
+                        out = slot.infer(model["serve_name"], 1, min(batch_max, used - start),
+                                         out_cols=out_cols(model), start=start)
+                    out = slot.output(used, out_cols(model))
                     failures = 0
                 except Exception as exc:
                     overload = is_overload(exc)
@@ -317,11 +333,13 @@ class Shard:
                     time.sleep(0.1 if overload else 0.5)
                     continue
                 M_INFER.labels(model_name).observe(time.perf_counter() - t0)
-                M_BATCH.labels(model_name).observe(len(taken))
+                M_BATCH.labels(model_name).observe(used)
+                M_WINDOWS.labels(model_name).inc(used)
                 t1 = time.perf_counter()
-                for i, (rt, sample) in enumerate(taken):
+                for rt, sample, first in taken:
+                    k = len(sample.windows)
                     try:
-                        self._post(rt, sample, out[i], slot.inputs[i], model, client)
+                        self._post(rt, sample, out[first:first + k], slot.inputs[first:first + k], model, client)
                     except Exception:
                         logger.exception("camera %s: post-processing failed", rt.id)
                 M_POST.observe(time.perf_counter() - t1)
@@ -352,9 +370,26 @@ class Shard:
                 time.sleep(2)
         raise SystemExit(0)
 
-    def _post(self, rt: CameraRuntime, sample: Sample, out: np.ndarray, frame: np.ndarray, model: dict,
+    @staticmethod
+    def _decode(sample: Sample, outs: np.ndarray, model: dict, conf: float, keep, merge_iou: float):
+        """A sample's detections in frame pixels: window 0 alone, or every window
+        decoded with its own letterbox and merged (tiling)."""
+        names = model["names"]
+        if model.get("task") == "pose":
+            kpt = tuple(model.get("kpt_shape") or (17, 3))
+            per = [decode_pose(o, m, names, kpt, conf=conf, classes=keep) for o, m in zip(outs, sample.metas)]
+        else:
+            per = [decode_detections(o, m, names, conf=conf, classes=keep) for o, m in zip(outs, sample.metas)]
+        if not sample.tiled:
+            return per[0]
+        return merge_windows(per, sample.windows, iou=merge_iou)
+
+    def _post(self, rt: CameraRuntime, sample: Sample, outs: np.ndarray, frames: np.ndarray, model: dict,
               client) -> None:
+        """``outs``/``frames``: the sample's windows' outputs and letterboxed inputs
+        (whole frame first). Triggered and classifier models use the whole frame."""
         now = time.time()
+        frame = frames[0]
         M_AGE.observe(now - sample.ts)
         with rt.lock:
             config = rt.config
@@ -364,11 +399,7 @@ class Shard:
                 wanted = set(config.classes)
                 keep = [i for i, n in names.items() if n in wanted]
             low = min(config.detect_confidence, 0.1)
-            if model.get("task") == "pose":
-                dets = decode_pose(out, sample.meta, names, tuple(model.get("kpt_shape") or (17, 3)), conf=low,
-                                   classes=keep)
-            else:
-                dets = decode_detections(out, sample.meta, names, conf=low, classes=keep)
+            dets = self._decode(sample, outs, model, low, keep, config.tiling.merge_iou)
             # ByteTrack wants the low-confidence detections too (second association stage).
             boxes = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32).reshape(-1, 4)
             scores = np.array([d.confidence for d in dets], dtype=np.float32)

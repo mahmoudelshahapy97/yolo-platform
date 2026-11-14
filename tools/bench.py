@@ -62,8 +62,9 @@ def clear(api):
         api.delete(f"/v1/cameras/{c['id']}").raise_for_status()
 
 
-def create(api, n, fps, stream, model, triggered):
-    config = {"rules": [{"name": "person", "type": "presence", "classes": ["person"], "cooldown_s": 30}]}
+def create(api, n, fps, stream, model, triggered, tiling="off"):
+    config = {"rules": [{"name": "person", "type": "presence", "classes": ["person"], "cooldown_s": 30}],
+              "tiling": {"mode": tiling}}
     if triggered:
         config["triggered"] = [{"model": "fire_detection", "every_s": 2.0, "min_confidence": 0.5, "cooldown_s": 60}]
     for i in range(n):
@@ -138,13 +139,15 @@ def main():
     ap.add_argument("--window", type=float, default=60)
     ap.add_argument("--label", default="bench")
     ap.add_argument("--stop-after-fail", type=int, default=1, help="stop after this many counts that do not keep up")
+    ap.add_argument("--tiling", choices=["off", "auto", "on"], default="off",
+                    help="cameras' tiling mode (auto tiles main streams: 5 inferences per frame)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--out", default="/artifacts/bench")
     args = ap.parse_args()
 
     api = httpx.Client(base_url=API, headers={"X-API-Key": KEY}, timeout=30)
     pc = httpx.Client()
-    meta = {"label": args.label, "fps": args.fps, "stream": args.stream, "model": args.model, "triggered": args.triggered,
+    meta = {"label": args.label, "fps": args.fps, "stream": args.stream, "model": args.model, "triggered": args.triggered, "tiling": args.tiling,
             "warmup_s": args.warmup, "window_s": args.window, "started": datetime.now(timezone.utc).isoformat(),
             "shards": prom_scalar(pc, "count(up{job='camera-shard'} == 1)"),
             "backend": os.environ.get("BENCH_BACKEND_NOTE", "")}
@@ -156,7 +159,7 @@ def main():
         for n in args.counts:
             clear(api)
             time.sleep(12)           # leases released, streams closed
-            create(api, n, args.fps, args.stream, args.model, args.triggered)
+            create(api, n, args.fps, args.stream, args.model, args.triggered, args.tiling)
             print(f"[{args.label}] {n} cameras: warming up {args.warmup:.0f}s", flush=True)
             time.sleep(args.warmup)
             r = measure(api, pc, n, args.fps, args.window)

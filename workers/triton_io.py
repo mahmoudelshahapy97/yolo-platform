@@ -45,23 +45,32 @@ class ShmSlot:
         self.inputs = shm.get_contents_as_numpy(self._in, np.uint8, [max_batch, size, size, 3])
         self.outputs = shm.get_contents_as_numpy(self._out, self.out_dtype, [max_batch, *out_shape])
 
-    def infer(self, model: str, version: int, n: int, timeout_s: float = 5.0, out_cols: Optional[int] = None) -> np.ndarray:
-        """Run ``n`` frames of the input region; ``out_cols`` is the model's row width (6 detect, 57 pose).
+    def infer(self, model: str, version: int, n: int, timeout_s: float = 5.0, out_cols: Optional[int] = None,
+              start: int = 0) -> np.ndarray:
+        """Run inputs ``start .. start+n`` of the input region; ``out_cols`` is the model's row width (6 detect, 57 pose).
 
         The output region is sized for the widest model; a narrower model's rows are
-        packed at the start of it, so the returned view is reshaped to [n, 300, out_cols].
+        packed (input i's at row i * 300), so the returned view is [n, 300, out_cols].
+        Calls with increasing ``start`` fill one packed output, read with ``output``.
         """
         rows, cols = self.out_shape[0], out_cols or self.out_shape[1]
         if cols > self.out_shape[1]:
             raise ValueError(f"model output width {cols} exceeds the slot's {self.out_shape[1]}")
-        nbytes = n * rows * cols * self.out_dtype.itemsize
+        if start < 0 or n < 1 or start + n > self.max_batch:
+            raise ValueError(f"inputs {start}..{start + n} do not fit the slot's {self.max_batch}")
+        per_in = self.size * self.size * 3
+        per_out = rows * cols * self.out_dtype.itemsize
         inp = grpcclient.InferInput("images", [n, self.size, self.size, 3], "UINT8")
-        inp.set_shared_memory(self.in_name, n * self.size * self.size * 3)
+        inp.set_shared_memory(self.in_name, n * per_in, offset=start * per_in)
         out = grpcclient.InferRequestedOutput("output0")
-        out.set_shared_memory(self.out_name, nbytes)
+        out.set_shared_memory(self.out_name, n * per_out, offset=start * per_out)
         self.client.infer(model, [inp], model_version=str(version), outputs=[out], client_timeout=timeout_s)
-        flat = self.outputs.reshape(-1)[: n * rows * cols]
-        return flat.reshape(n, rows, cols)
+        return self.output(start + n, cols)[start:]
+
+    def output(self, n: int, out_cols: Optional[int] = None) -> np.ndarray:
+        """The packed outputs of inputs 0 .. n, [n, 300, out_cols]."""
+        rows, cols = self.out_shape[0], out_cols or self.out_shape[1]
+        return self.outputs.reshape(-1)[: n * rows * cols].reshape(n, rows, cols)
 
     def close(self) -> None:
         for name, region in ((self.in_name, self._in), (self.out_name, self._out)):

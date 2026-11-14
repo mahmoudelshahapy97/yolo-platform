@@ -31,6 +31,9 @@ class _Source:
     def has_fresh(self):
         return True
 
+    def fresh_windows(self):
+        return 1
+
     def take(self, buf):
         self.taken += 1
         return None          # nothing to infer: the loop just goes round again
